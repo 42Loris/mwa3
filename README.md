@@ -42,7 +42,7 @@ ALLOWED_HOSTS=localhost 127.0.0.1
 3. Start with Docker Compose:
 ```bash
 cd docker
-docker-compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml up -d
 ```
 
 4. Access at `http://localhost:80`
