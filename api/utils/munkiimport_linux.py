@@ -337,30 +337,26 @@ def _extract_with_7z(src: str, dest: str) -> bool:
 
 
 def _extract_dmg_with_dmg2img(dmgpath: str, dest: str) -> bool:
-    """Fallback: convert DMG to IMG using dmg2img, then extract IMG"""
+    """Try converting DMG to IMG with dmg2img, then extract with 7z"""
     if not shutil.which("dmg2img"):
         return False
     
     # Convert DMG to IMG
     img_path = os.path.join(dest, "extracted.img")
-    convert_cmd = ["dmg2img", dmgpath, img_path]
-    proc = subprocess.run(convert_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(["dmg2img", dmgpath, img_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
     if proc.returncode != 0:
-        stderr = proc.stderr.decode('utf-8', errors='replace')
-        print(f"Error converting DMG with dmg2img: {stderr}", file=sys.stderr)
         return False
     
-    # Try to extract IMG with 7z
-    if _extract_with_7z(img_path, dest):
-        # Clean up the IMG file
-        try:
-            os.remove(img_path)
-        except OSError:
-            pass
-        return True
+    # Extract IMG with 7z
+    success = _extract_with_7z(img_path, dest)
     
-    return False
+    try:
+        os.remove(img_path)
+    except OSError:
+        pass
+    
+    return success
 
 
 def mountdmg(dmgpath, mountpoint=None):
