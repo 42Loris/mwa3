@@ -61,8 +61,9 @@ except ImportError:
 
 if platform.system() == "Darwin":
     from munkilib.admin.pkginfolib import makepkginfo
+    PkgInfoGenerationError = None
 else:
-    from api.utils.munkiimport_linux import makepkginfo
+    from api.utils.munkiimport_linux import makepkginfo, PkgInfoGenerationError
 
 
 def normalize_value_for_filtering(value):
@@ -705,7 +706,13 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
 
             # Generate pkginfo
             options = {}
-            pkginfo = makepkginfo(temp_file_path, options)
+            try:
+                pkginfo = makepkginfo(temp_file_path, options)
+            except Exception as e:
+                if platform.system() != "Darwin" and PkgInfoGenerationError and isinstance(e, PkgInfoGenerationError):
+                    LOGGER.warning(f"Pkginfo generation failed for {filename}: {e}")
+                    return Response({'error': f'Failed to generate pkginfo: {str(e)}'}, status=400)
+                raise
             if not pkginfo:
                 LOGGER.error("makepkginfo returned None")
                 return Response({'error': 'Failed to generate pkginfo - invalid package format'}, status=400)

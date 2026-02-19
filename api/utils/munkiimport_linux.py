@@ -314,120 +314,74 @@ def diskImageIsMounted(dmgpath):
     return False
 
 
-def _has_supported_installer_item(path):
-    """Check if directory contains .pkg, .mpkg, or .app files"""
-    if not os.path.isdir(path):
-        return False
-    for item in os.listdir(path):
-        item_path = os.path.join(path, item)
-        if hasValidPackageExt(item_path) or item.endswith('.app'):
-            return True
-    return False
-
-
-def _extract_with_7z(src: str, dest: str) -> bool:
-    """Helper to extract files with 7z"""
-    extract_cmd = ["7z", "x", src, f"-o{dest}", "-y"]
-    proc = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode('utf-8', errors='replace')
-        print(f"Error extracting {src}: {stderr}", file=sys.stderr)
-        return False
-    return True
-
-
-def _extract_dmg_with_dmg2img(dmgpath: str, dest: str) -> bool:
-    """Convert DMG to IMG, mount, copy contents"""
-    img_path = os.path.join(dest, "img")
-    img_mount = os.path.join(dest, "mnt")
-    
-    # Convert DMG to IMG
-    if subprocess.run(["dmg2img", dmgpath, img_path], capture_output=True).returncode != 0:
-        return False
-    
-    # Create mount point
-    os.makedirs(img_mount, exist_ok=True)
-    
-    # Mount IMG
-    if subprocess.run(["mount", "-o", "loop,ro", img_path, img_mount], capture_output=True).returncode != 0:
-        return False
-    
-    # Copy contents
-    try:
-        for item in os.listdir(img_mount):
-            src = os.path.join(img_mount, item)
-            dst = os.path.join(dest, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-    finally:
-        subprocess.run(["umount", img_mount], capture_output=True)
-        shutil.rmtree(img_mount, ignore_errors=True)
-        os.remove(img_path) if os.path.exists(img_path) else None
-    
-    return True
-
-
 def mountdmg(dmgpath, mountpoint=None):
-    """Extracts a DMG file on Linux using 7z with dmg2img fallback."""
+    """Extracts a DMG file on Linux using 7z/7zz instead of mounting.
+
+    Keep this intentionally simple:
+    - Prefer `7zz` when available.
+    - If extraction returns non-zero but still produced files, treat it as a
+      warning (common for DMGs with partial/unsupported sections).
+    - If the DMG only yielded an embedded image file (e.g. *.hfs), try one
+      extra extraction step on that file.
+    """
+
+    seven_zip = shutil.which("7zz") or shutil.which("7z")
+    if not seven_zip:
+        print(
+            "Error: `7zz`/`7z` is not installed. Install 7-Zip (e.g. `apt install p7zip-full`).",
+            file=sys.stderr,
+        )
+        return ""
+
     if not mountpoint:
         base = os.path.splitext(os.path.basename(dmgpath))[0]
         mountpoint = os.path.join(tempfile.gettempdir(), f"mnt_{base}")
 
     os.makedirs(mountpoint, exist_ok=True)
 
-    if not shutil.which("7z"):
-        print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
-        return ""
-
-    # Try extract the DMG with 7z
-    extraction_successful = _extract_with_7z(dmgpath, mountpoint)
-    
-    # If 7z fails, try dmg2img fallback
-    if not extraction_successful:
-        if shutil.which("dmg2img"):
-            print(f"7z extraction failed, attempting dmg2img fallback...")
-            extraction_successful = _extract_dmg_with_dmg2img(dmgpath, mountpoint)
-        else:
-            print("Error: `dmg2img` is not installed. Install it with `apt install dmg2img`.", file=sys.stderr)
-            return ""
-    
-    if not extraction_successful:
-        return ""
-
-    if _has_supported_installer_item(mountpoint):
-        print(f"DMG extracted to {mountpoint}")
-        return mountpoint
-
-    # look for nested disk images and extract them
-    candidate_exts = {'.hfs', '.img', '.iso', '.dmg'}
-    candidates = []
-    try:
-        for name in os.listdir(mountpoint):
-            path = os.path.join(mountpoint, name)
-            if not os.path.isfile(path):
-                continue
-            _, ext = os.path.splitext(name)
-            if ext.lower() in candidate_exts:
-                candidates.append(path)
-    except OSError:
-        candidates = []
-
-    # If nothing found by extension, try single file in directory
-    if not candidates:
+    def _dir_has_entries(path):
         try:
-            files = [os.path.join(mountpoint, n) for n in os.listdir(mountpoint)]
-            files = [p for p in files if os.path.isfile(p)]
-            if len(files) == 1:
-                candidates = files
+            return any(True for _ in os.scandir(path))
         except OSError:
-            candidates = []
+            return False
 
-    for candidate in candidates:
+    def _extract(src, dest):
+        proc = subprocess.run(
+            [seven_zip, "x", src, f"-o{dest}", "-y"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            if stderr:
+                print(f"Warning extracting {src}: {stderr}", file=sys.stderr)
+        return _dir_has_entries(dest)
+
+    # First pass: extract the DMG container.
+    if not _extract(dmgpath, mountpoint):
+        return ""
+
+    # Optional second pass: if an embedded image file was produced, extract it.
+    candidate_exts = {".hfs", ".img", ".iso", ".dmg", ".udif", ".sparseimage", ".apfs"}
+    try:
+        files = [os.path.join(mountpoint, n) for n in os.listdir(mountpoint)]
+        files = [p for p in files if os.path.isfile(p)]
+    except OSError:
+        files = []
+
+    candidate = None
+    for p in files:
+        _, ext = os.path.splitext(p)
+        if ext.lower() in candidate_exts:
+            candidate = p
+            break
+    if candidate is None and len(files) == 1:
+        candidate = files[0]
+
+    if candidate:
         inner_dir = os.path.join(mountpoint, "_inner")
         os.makedirs(inner_dir, exist_ok=True)
-        if _extract_with_7z(candidate, inner_dir) and _has_supported_installer_item(inner_dir):
+        if _extract(candidate, inner_dir):
             print(f"DMG extracted to {inner_dir}")
             return inner_dir
 
@@ -437,12 +391,18 @@ def mountdmg(dmgpath, mountpoint=None):
 
 def unmountdmg(dmgpath, mountpoint):
     """Cleans up extracted DMG files using 7z."""
-    
+
+    # mountpoint may be returned as a string path; in older call-sites it could
+    # also be a list/tuple of mount points.
+    if isinstance(mountpoint, (list, tuple)):
+        for mp in mountpoint:
+            unmountdmg(dmgpath, mp)
+        return
+
     if not os.path.exists(mountpoint):
         print(f"Warning: {mountpoint} does not exist.", file=sys.stderr)
         return
-    
-    # delete the mountpoint
+
     try:
         shutil.rmtree(mountpoint)
         print(f"{mountpoint} successfully removed.")
@@ -1050,18 +1010,31 @@ def getPkgRestartInfo(filename):
 
 def getReceiptInfo(pkgname):
     """Get receipt info (a dict) from a package"""
-    info = []
-    if hasValidPackageExt(pkgname):
-        if os.path.isfile(pkgname):       # new flat package
-            info = getFlatPackageInfo(pkgname)
+    # Always return a dict with at least a 'receipts' key so callers can be
+    # defensive without needing to special-case failures.
+    info = {"receipts": [], "product_version": None}
 
-        if os.path.isdir(pkgname):        # bundle-style package?
-            info = getBundlePackageInfo(pkgname)
+    if hasValidPackageExt(pkgname):
+        if os.path.isfile(pkgname):  # flat package (XAR)
+            flat_info = getFlatPackageInfo(pkgname)
+            if isinstance(flat_info, dict):
+                # Keep only known keys to avoid unexpected shapes.
+                info["receipts"] = flat_info.get("receipts") or []
+                info["product_version"] = flat_info.get("product_version")
+            elif isinstance(flat_info, list):
+                info["receipts"] = flat_info
+
+        elif os.path.isdir(pkgname):  # bundle-style package
+            bundle_info = getBundlePackageInfo(pkgname)
+            if isinstance(bundle_info, dict):
+                info["receipts"] = bundle_info.get("receipts") or []
+                info["product_version"] = bundle_info.get("product_version")
 
     elif pkgname.endswith('.dist'):
-        receiptarray = parsePkgRefs(pkgname)
-        info = {"receipts": receiptarray}
+        info["receipts"] = parsePkgRefs(pkgname)
 
+    if info.get("receipts") is None:
+        info["receipts"] = []
     return info
 
 
@@ -1174,18 +1147,26 @@ def getFlatPackageInfo(pkgpath):
     pkgtmp = tempfile.mkdtemp()
     cwd = os.getcwd()
 
-    # Check if `7z` is installed
+    # Check for 7z. Some deployments (notably Azure App Service zip deploy)
+    # don't provide it and you typically can't apt-get at runtime.
+    # Return a minimal shape so callers can proceed.
     if not shutil.which("7z"):
-        print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
-        return {}
+        print(
+            "Warning: `7z` is not installed; skipping receipt extraction for flat packages.",
+            file=sys.stderr,
+        )
+        return {"receipts": [], "product_version": None}
 
     try:
         # Extract the .pkg using `7z`
         cmd_extract = ["7z", "x", abspkgpath, f"-o{pkgtmp}"]
         proc = subprocess.run(cmd_extract, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
-            print(f"Error extracting {pkgpath}: {proc.stderr.decode('utf-8')}", file=sys.stderr)
-            return {}
+            print(
+                f"Error extracting {pkgpath}: {proc.stderr.decode('utf-8', errors='replace')}",
+                file=sys.stderr,
+            )
+            return {"receipts": [], "product_version": None}
 
         # Search for `PackageInfo` files
         for root, _, files in os.walk(pkgtmp):
@@ -1219,7 +1200,7 @@ def getFlatPackageInfo(pkgpath):
 
     except Exception as e:
         print(f"Error processing {pkgpath}: {e}", file=sys.stderr)
-        return {}
+        return {"receipts": [], "product_version": None}
 
     finally:
         os.chdir(cwd)  # Switch back to the original working directory
