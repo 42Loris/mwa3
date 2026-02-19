@@ -18,7 +18,6 @@ RUN apt-get update \
     libpq-dev liblcms2-dev libblas-dev libatlas-base-dev pkg-config curl unzip \
     git fuse3 libfuse3-dev golang p7zip-full \
     libmagic1t64 \
-    p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 # -------
 
