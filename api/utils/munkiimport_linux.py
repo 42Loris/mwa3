@@ -337,26 +337,36 @@ def _extract_with_7z(src: str, dest: str) -> bool:
 
 
 def _extract_dmg_with_dmg2img(dmgpath: str, dest: str) -> bool:
-    """Try converting DMG to IMG with dmg2img, then extract with 7z"""
-    if not shutil.which("dmg2img"):
-        return False
+    """Convert DMG to IMG, mount, copy contents"""
+    img_path = os.path.join(dest, "img")
+    img_mount = os.path.join(dest, "mnt")
     
     # Convert DMG to IMG
-    img_path = os.path.join(dest, "extracted.img")
-    proc = subprocess.run(["dmg2img", dmgpath, img_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    
-    if proc.returncode != 0:
+    if subprocess.run(["dmg2img", dmgpath, img_path], capture_output=True).returncode != 0:
         return False
     
-    # Extract IMG with 7z
-    success = _extract_with_7z(img_path, dest)
+    # Create mount point
+    os.makedirs(img_mount, exist_ok=True)
     
+    # Mount IMG
+    if subprocess.run(["mount", "-o", "loop,ro", img_path, img_mount], capture_output=True).returncode != 0:
+        return False
+    
+    # Copy contents
     try:
-        os.remove(img_path)
-    except OSError:
-        pass
+        for item in os.listdir(img_mount):
+            src = os.path.join(img_mount, item)
+            dst = os.path.join(dest, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+    finally:
+        subprocess.run(["umount", img_mount], capture_output=True)
+        shutil.rmtree(img_mount, ignore_errors=True)
+        os.remove(img_path) if os.path.exists(img_path) else None
     
-    return success
+    return True
 
 
 def mountdmg(dmgpath, mountpoint=None):
@@ -390,7 +400,7 @@ def mountdmg(dmgpath, mountpoint=None):
         print(f"DMG extracted to {mountpoint}")
         return mountpoint
 
-    # Stage 2: look for nested disk images and extract them
+    # look for nested disk images and extract them
     candidate_exts = {'.hfs', '.img', '.iso', '.dmg'}
     candidates = []
     try:
