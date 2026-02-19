@@ -649,16 +649,18 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
             uploaded_file.seek(0)  # Reset file pointer
             mime_type = magic.from_buffer(file_content, mime=True)
 
-            # Valid MIME types for pkg (XAR archives) and dmg files
-            valid_mimes = [
-                'application/x-xar',  # .pkg files
-                'application/x-apple-diskimage',  # .dmg files
-                'application/octet-stream'  # Fallback for some valid files
-            ]
+            # PKG: must be a XAR archive (starts with b"xar!")
+            if file_ext == '.pkg':
+                if not file_content.startswith(b"xar!"):
+                    LOGGER.warning(f"Invalid PKG detected (missing xar header): {mime_type} for file {filename}")
+                    return Response({'error': 'Invalid PKG file.'}, status=400)
 
-            if mime_type not in valid_mimes:
-                LOGGER.warning(f"Invalid file type detected: {mime_type} for file {filename}")
-                return Response({'error': f'Invalid file type: {mime_type}. Only PKG and DMG files are allowed.'}, status=400)
+            # DMG: depending on libmagic/version, valid DMGs may appear as
+            # application/x-apple-diskimage, application/zlib, or octet-stream.
+            if file_ext == '.dmg':
+                if mime_type not in ('application/x-apple-diskimage', 'application/zlib', 'application/octet-stream'):
+                    LOGGER.warning(f"Invalid DMG type detected: {mime_type} for file {filename}")
+                    return Response({'error': f'Invalid DMG file type: {mime_type}.'}, status=400)
 
             LOGGER.info(f"File validation successful: {filename} ({mime_type})")
         except Exception as e:
