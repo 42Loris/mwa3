@@ -18,10 +18,14 @@ MEDIA_URL = "/media/"
 APPNAME = os.getenv('APPNAME', 'MunkiWebAdmin')
 DEFAULT_MANIFEST = os.getenv('DEFAULT_MANIFEST', 'serial_number')
 SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGEME!!!")
+
+# debug mode
+DEBUG = os.getenv("DEBUG", 'False').lower() in ('true', '1', 't')
+
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost 127.0.0.1 [::1]").split(" ")
 CSRF_TRUSTED_ORIGINS = os.environ.get("CSRF_TRUSTED_ORIGINS", "http://localhost").split(" ")
-CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'True').lower() in ('true', '1', 't')
-CSRF_COOKIE_HTTPONLY = True
+CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', str(not DEBUG)).lower() in ('true', '1', 't')
+CSRF_COOKIE_HTTPONLY = os.getenv('CSRF_COOKIE_HTTPONLY', 'False').lower() in ('true', '1', 't')
 
 # Security Headers
 SECURE_BROWSER_XSS_FILTER = True
@@ -57,7 +61,7 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET', None)
 TENANT_ID = os.getenv('TENANT_ID', None)
 ENTRA_ONLY = os.getenv('ENTRA_ONLY', 'False').lower() in ('true', '1', 't')
 EXCLUDE_API = os.getenv('EXCLUDE_API', False)
-SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', False)
+SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False').lower() in ('true', '1', 't')
 
 if SECURE_SSL_REDIRECT:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -66,9 +70,6 @@ if SECURE_SSL_REDIRECT:
 if os.environ.get('WEBSITE_HOSTNAME'):
     ALLOWED_HOSTS.append(os.environ.get('WEBSITE_HOSTNAME'))
     CSRF_TRUSTED_ORIGINS.append("https://" + os.environ.get('WEBSITE_HOSTNAME'))
-
-# debug mode
-DEBUG = os.getenv("DEBUG", 'False').lower() in ('true', '1', 't')
 
 # package display settings
 ENABLE_REPO_VIEW = os.getenv('ENABLE_REPO_VIEW', 'False').lower() in ('true', '1', 't')

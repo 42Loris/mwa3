@@ -20,6 +20,8 @@ config.codekit3
 *.log*
 migrations
 
+favicon.ico
+
 virtualenv*
 venv*
 munkirepo*

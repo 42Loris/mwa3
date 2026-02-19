@@ -626,7 +626,8 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
             return Response({'error': 'No file provided'}, status=400)
 
         uploaded_file = request.FILES['file']
-        filename = uploaded_file.name
+        # Avoid any path components from the client
+        filename = os.path.basename(uploaded_file.name)
         file_ext = os.path.splitext(filename)[1].lower()
 
         # File size validation (prevent DoS)
@@ -678,16 +679,18 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
         # Normalize path
         filepath = os.path.normpath(filepath)
 
-        # Create unique temporary file to avoid race conditions
+        # Create unique temporary directory to avoid race conditions while
+        # preserving the original filename (some pkginfo generators derive
+        # names from the input filename)
+        temp_dir = None
         temp_file_path = None
         pkg_path_written = None
         pkginfo_path_written = None
 
         try:
-            # Generate unique temporary filename
-            unique_id = uuid.uuid4().hex[:8]
-            temp_filename = f"{unique_id}_{filename}"
-            temp_file_path = os.path.join(tempfile.gettempdir(), temp_filename)
+            # Generate unique temp directory and write file with original name
+            temp_dir = tempfile.mkdtemp(prefix="mwa_upload_")
+            temp_file_path = os.path.join(temp_dir, filename)
 
             LOGGER.info(f"Creating temporary file: {temp_file_path}")
 
@@ -855,13 +858,13 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
                     pass
             return Response({'error': f'Failed to process upload: {str(e)}'}, status=500)
         finally:
-            # Always clean up temporary file
-            if temp_file_path and os.path.exists(temp_file_path):
+            # Always clean up temporary file/dir
+            if temp_dir and os.path.exists(temp_dir):
                 try:
-                    os.remove(temp_file_path)
-                    LOGGER.info(f"Temporary file deleted: {temp_file_path}")
+                    shutil.rmtree(temp_dir)
+                    LOGGER.info(f"Temporary upload directory deleted: {temp_dir}")
                 except OSError as e:
-                    LOGGER.warning(f"Failed to delete temporary file {temp_file_path}: {e}")
+                    LOGGER.warning(f"Failed to delete temporary upload directory {temp_dir}: {e}")
 
     def put(self, request, *args, **kwargs):
         """Allows updating an existing package file in the Munki repository."""
