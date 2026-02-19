@@ -26,6 +26,8 @@ from xml.dom import minidom
 # import munkitools
 from django.conf import settings
 MUNKITOOLS_DIR = settings.MUNKITOOLS_DIR
+DEFAULT_CATALOG = settings.DEFAULT_CATALOG
+
 sys.path.append(MUNKITOOLS_DIR)
 from munkilib.admin.common import list_items_of_kind
 from munkilib.cliutils import pref
@@ -481,7 +483,7 @@ def makepkginfo(installeritem, options):
         if options.nopkg:
             pkginfo['installer_type'] = "nopkg"
 
-    pkginfo['catalogs'] = ['testing']
+    pkginfo['catalogs'] = [DEFAULT_CATALOG]
 
     default_minosversion = "10.4.0"
     maxfileversion = "0.0.0.0.0"
