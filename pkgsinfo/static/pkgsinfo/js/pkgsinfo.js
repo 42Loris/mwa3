@@ -773,7 +773,17 @@ function uploadPackage() {
     closeButton.disabled = true;
 
     var xhr = new XMLHttpRequest();
-    xhr.open("POST", `/api/pkgs/${encodeURIComponent(subdirectory.replace(/\/$/, '') + '/' + file.name)}`, true);
+    // Encode each path component, but keep '/' separators intact.
+    // Encoding the entire string would turn '/' into '%2F', which many servers
+    // treat as suspicious and respond with a 400 Bad Request.
+    const normalizedSubdir = subdirectory.replace(/\/+$/, '');
+    const encodedSubdir = normalizedSubdir
+        .split('/')
+        .filter(Boolean)
+        .map(encodeURIComponent)
+        .join('/');
+    const encodedFilename = encodeURIComponent(file.name);
+    xhr.open("POST", `/api/pkgs/${encodedSubdir}/${encodedFilename}`, true);
 
     // Set CSRF token header
     xhr.setRequestHeader("X-CSRFToken", getCSRFToken());
@@ -789,7 +799,7 @@ function uploadPackage() {
                     progressBar.classList.add("progress-bar-animated");
                     progressBar.classList.add("progress-bar-striped");
                     progressBar.innerText = "Preparing package...";
-                }, 500); // Kleine Verzögerung für bessere UX
+                }, 500); // Small delay for better UX
             }
         }
     };
@@ -797,7 +807,7 @@ function uploadPackage() {
     xhr.onload = function() {
         if (xhr.status === 201) {
             let response = JSON.parse(xhr.responseText);
-            let pkginfoPath = response.pkginfo_path;  // Enthält bereits '#'
+            let pkginfoPath = response.pkginfo_path;  // Already includes '#'
 
             showAlert("Upload successful! Preparing package...", "success");
 

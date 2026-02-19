@@ -124,11 +124,11 @@
             }
         }
 
-        // Überwache Änderungen am Bootstrap-Theme
+        // Watch for changes to the Bootstrap theme
         const observer = new MutationObserver(updateLogo);
         observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-bs-theme"] });
 
-        // Initiales Setzen des Logos
+        // Set the initial logo
         updateLogo();
     });
 </script>

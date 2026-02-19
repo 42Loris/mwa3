@@ -70,31 +70,31 @@ $(window).on('load', function() {
 
 
 document.addEventListener("DOMContentLoaded", function () {
-    // API-Endpunkt für aktive Benutzer
+    // API endpoint for active users
     const activeUsersUrl = "/monitoring/get-active-users/";
 
-    // HTML-Elemente
+    // HTML elements
     const badgeElement = document.getElementById("activeUsersBadge");
     const dropdownMenu = document.createElement("div");
     dropdownMenu.classList.add("dropdown-menu", "dropdown-menu-end");
     badgeElement.after(dropdownMenu);
 
-    // Funktion zum Abrufen der aktiven Benutzer
+    // Fetch active users
     async function fetchActiveUsers() {
         try {
             const response = await fetch(activeUsersUrl);
-            if (!response.ok) throw new Error("Fehler beim Laden der aktiven Benutzer");
+            if (!response.ok) throw new Error("Failed to load active users");
 
             const data = await response.json();
 
-            // Anzahl der aktiven Benutzer aktualisieren
+            // Update the active user count
             const activeUserCount = data.active_users.length;
             badgeElement.querySelector(".badge").textContent = activeUserCount;
 
-            // Dropdown-Inhalt neu setzen
+            // Rebuild dropdown content
             dropdownMenu.innerHTML = "";
             if (activeUserCount === 0) {
-                dropdownMenu.innerHTML = '<span class="dropdown-item">Keine aktiven Benutzer</span>';
+                dropdownMenu.innerHTML = '<span class="dropdown-item">No active users</span>';
             } else {
                 data.active_users.forEach(user => {
                     const userItem = document.createElement("span");
@@ -104,13 +104,13 @@ document.addEventListener("DOMContentLoaded", function () {
                 });
             }
         } catch (error) {
-            console.error("Fehler beim Abrufen der aktiven Benutzer:", error);
+            console.error("Failed to fetch active users:", error);
         }
     }
 
-    // Initiale Abfrage beim Laden der Seite
+    // Initial fetch on page load
     fetchActiveUsers();
 
-    // Alle 10 Sekunden aktualisieren
+    // Refresh every 10 seconds
     setInterval(fetchActiveUsers, 10000);
 });

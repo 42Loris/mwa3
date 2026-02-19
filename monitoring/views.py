@@ -30,8 +30,8 @@ def get_active_users(request):
         
         user_data = []
         for session in active_sessions:
-            data = session.get_decoded()  # Entschlüsselt die session_data
-            user_id = data.get('_auth_user_id')  # User-ID auslesen
+            data = session.get_decoded()  # Decode session data
+            user_id = data.get('_auth_user_id')  # Extract user ID
             if user_id:
                 try:
                     user = User.objects.get(id=user_id)
@@ -46,7 +46,7 @@ def get_active_users(request):
                         "last_activity": last_activity.strftime('%Y-%m-%d %H:%M:%S')
                     })
                 except User.DoesNotExist:
-                    logger.warning(f"User {user_id} nicht gefunden")
+                    logger.warning(f"User {user_id} not found")
 
         return JsonResponse({'active_users': user_data}, json_dumps_params={"ensure_ascii": False})
     except Exception as e:

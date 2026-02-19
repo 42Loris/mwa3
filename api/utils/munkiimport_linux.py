@@ -711,39 +711,52 @@ def getPackageMetaData(pkgitem):
 
 
 def getChoiceChangesXML(pkgitem):
-    """Extracts and parses 'ChoiceChangesXML' from a macOS .pkg under Linux using 7z."""
+    """Best-effort extraction of choice data from a macOS .pkg under Linux.
+
+    Note: macOS "Distribution" files are generally *not* plists, so attempting
+    to parse them with plistlib can fail. This function is currently unused in
+    this repo; keep it safe and quiet to avoid noisy logs during uploads.
+    """
     choices = []
 
-    # Prüfen, ob `7z` installiert ist
+    # check if `7z` is installed
     if not shutil.which("7z"):
         print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
         return choices
 
-    # Temporäres Verzeichnis zum Entpacken
+    # tmp dir to unzip
     temp_dir = tempfile.mkdtemp()
 
     try:
-        # Entpacke das .pkg mit `7z`
+        # Unzip .pkg with `7z`
         cmd = ["7z", "x", pkgitem, f"-o{temp_dir}"]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             print(f"Error extracting {pkgitem}: {proc.stderr.decode('utf-8')}", file=sys.stderr)
             return choices
 
-        # Suche nach der `Distribution`-Datei (enthält ChoiceChangesXML)
+        # The `Distribution` file is typically XML, not a plist.
         distribution_path = os.path.join(temp_dir, "Distribution")
         if os.path.exists(distribution_path):
-            with open(distribution_path, "rb") as f:
-                plist_data = plistlib.load(f)
+            try:
+                with open(distribution_path, "rb") as f:
+                    plist_data = plistlib.load(f)
+                if isinstance(plist_data, list):
+                    # Only keep dict-like entries; ignore nulls/non-dicts.
+                    choices = [
+                        item for item in plist_data
+                        if isinstance(item, dict) and 'selected' in str(item.get('choiceAttribute', ''))
+                    ]
+            except Exception:
+                # Expected for most packages (Distribution isn't a plist).
+                choices = []
 
-            # Prüfe, ob 'choiceAttribute' mit 'selected' existiert
-            choices = [item for item in plist_data if 'selected' in item.get('choiceAttribute', '')]
-
-    except Exception as e:
-        print(f"Error processing {pkgitem}: {e}", file=sys.stderr)
+    except Exception:
+        # Best-effort only; don't spam stderr for metadata we can live without.
+        choices = []
 
     finally:
-        # Temporäres Verzeichnis bereinigen
+        # Clean up the temporary directory.
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return choices
@@ -884,39 +897,60 @@ def getPkgRestartInfo(filename):
     """Extracts RestartAction info from a macOS .pkg under Linux using 7z."""
     installerinfo = {}
 
-    # Prüfen, ob `7z` installiert ist
+    # Check if `7z` is installed
     if not shutil.which("7z"):
         print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
         return installerinfo
 
-    # Temporäres Verzeichnis zum Entpacken
+    # Temporary directory for extracting the package
     temp_dir = tempfile.mkdtemp()
 
     try:
-        # Entpacke das .pkg mit `7z`
+        # Extract the .pkg using `7z`
         cmd = ["7z", "x", filename, f"-o{temp_dir}"]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             print(f"Error extracting {filename}: {proc.stderr.decode('utf-8')}", file=sys.stderr)
             return installerinfo
 
-        # Suche nach der `Distribution`- oder `PackageInfo`-Datei
+        # Look for `Distribution` or `PackageInfo`
         for possible_file in ["Distribution", "PackageInfo"]:
             file_path = os.path.join(temp_dir, possible_file)
             if os.path.exists(file_path):
-                with open(file_path, "rb") as f:
-                    plist_data = plistlib.load(f)
+                # These files are usually XML (not plists). Try plist first (in
+                # case a tool produced a plist), then fall back to XML parsing.
+                restart_action = None
 
-                # Prüfe, ob `RestartAction` existiert
-                if plist_data.get("RestartAction") and plist_data["RestartAction"] != "None":
-                    installerinfo["RestartAction"] = plist_data["RestartAction"]
-                    break  # Falls gefunden, nicht weiter suchen
+                try:
+                    with open(file_path, "rb") as f:
+                        parsed = plistlib.load(f)
+                    if isinstance(parsed, dict):
+                        restart_action = parsed.get("RestartAction")
+                except Exception:
+                    restart_action = None
 
-    except Exception as e:
-        print(f"Error processing {filename}: {e}", file=sys.stderr)
+                if not restart_action:
+                    try:
+                        dom = minidom.parse(file_path)
+                        # Common tag spellings seen in package metadata.
+                        for tag in ("restartAction", "restart-action"):
+                            nodes = dom.getElementsByTagName(tag)
+                            if nodes and nodes[0].firstChild:
+                                restart_action = nodes[0].firstChild.wholeText.strip()
+                                break
+                    except Exception:
+                        restart_action = None
+
+                if restart_action and restart_action != "None":
+                    installerinfo["RestartAction"] = restart_action
+                    break  # Found, stop searching
+
+    except Exception:
+        # RestartAction is optional metadata; don't spam stderr.
+        installerinfo = {}
 
     finally:
-        # Temporäres Verzeichnis bereinigen
+        # Cleanup temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return installerinfo
@@ -1047,27 +1081,27 @@ def getFlatPackageInfo(pkgpath):
     pkgtmp = tempfile.mkdtemp()
     cwd = os.getcwd()
 
-    # Prüfen, ob `7z` installiert ist
+    # Check if `7z` is installed
     if not shutil.which("7z"):
         print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
         return {}
 
     try:
-        # Entpacke das .pkg mit `7z`
+        # Extract the .pkg using `7z`
         cmd_extract = ["7z", "x", abspkgpath, f"-o{pkgtmp}"]
         proc = subprocess.run(cmd_extract, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             print(f"Error extracting {pkgpath}: {proc.stderr.decode('utf-8')}", file=sys.stderr)
             return {}
 
-        # Suche nach `PackageInfo`-Dateien
+        # Search for `PackageInfo` files
         for root, _, files in os.walk(pkgtmp):
             for file in files:
                 if file == "PackageInfo":
                     packageinfoabspath = os.path.abspath(os.path.join(root, file))
                     receiptarray.extend(parsePkgRefs(packageinfoabspath))
 
-        # Falls keine `PackageInfo`-Dateien gefunden wurden, nach `Distribution` suchen
+        # If no `PackageInfo` files were found, look for `Distribution`
         if not receiptarray:
             for root, _, files in os.walk(pkgtmp):
                 for file in files:
@@ -1082,7 +1116,7 @@ def getFlatPackageInfo(pkgpath):
                 file=sys.stderr
             )
 
-        # Produktversion extrahieren
+        # Extract product version
         productversion = None
         for root, _, files in os.walk(pkgtmp):
             for file in files:
@@ -1095,8 +1129,8 @@ def getFlatPackageInfo(pkgpath):
         return {}
 
     finally:
-        os.chdir(cwd)  # Zurück zum Originalverzeichnis wechseln
-        shutil.rmtree(pkgtmp)  # Temporäres Verzeichnis aufräumen
+        os.chdir(cwd)  # Switch back to the original working directory
+        shutil.rmtree(pkgtmp)  # Remove temporary directory
 
     info = {
         "receipts": receiptarray,
