@@ -336,8 +336,35 @@ def _extract_with_7z(src: str, dest: str) -> bool:
     return True
 
 
+def _extract_dmg_with_dmg2img(dmgpath: str, dest: str) -> bool:
+    """Fallback: convert DMG to IMG using dmg2img, then extract IMG"""
+    if not shutil.which("dmg2img"):
+        return False
+    
+    # Convert DMG to IMG
+    img_path = os.path.join(dest, "extracted.img")
+    convert_cmd = ["dmg2img", dmgpath, img_path]
+    proc = subprocess.run(convert_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode('utf-8', errors='replace')
+        print(f"Error converting DMG with dmg2img: {stderr}", file=sys.stderr)
+        return False
+    
+    # Try to extract IMG with 7z
+    if _extract_with_7z(img_path, dest):
+        # Clean up the IMG file
+        try:
+            os.remove(img_path)
+        except OSError:
+            pass
+        return True
+    
+    return False
+
+
 def mountdmg(dmgpath, mountpoint=None):
-    """Extracts a DMG file on Linux using 7z, with support for nested images."""
+    """Extracts a DMG file on Linux using 7z with dmg2img fallback."""
     if not mountpoint:
         base = os.path.splitext(os.path.basename(dmgpath))[0]
         mountpoint = os.path.join(tempfile.gettempdir(), f"mnt_{base}")
@@ -348,8 +375,19 @@ def mountdmg(dmgpath, mountpoint=None):
         print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
         return ""
 
-    # Stage 1: extract the DMG itself
-    if not _extract_with_7z(dmgpath, mountpoint):
+    # Try extract the DMG with 7z
+    extraction_successful = _extract_with_7z(dmgpath, mountpoint)
+    
+    # If 7z fails, try dmg2img fallback
+    if not extraction_successful:
+        if shutil.which("dmg2img"):
+            print(f"7z extraction failed, attempting dmg2img fallback...")
+            extraction_successful = _extract_dmg_with_dmg2img(dmgpath, mountpoint)
+        else:
+            print("Error: `dmg2img` is not installed. Install it with `apt install dmg2img`.", file=sys.stderr)
+            return ""
+    
+    if not extraction_successful:
         return ""
 
     if _has_supported_installer_item(mountpoint):
