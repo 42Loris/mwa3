@@ -46,7 +46,7 @@ MUNKITOOLS_DIR = os.getenv('MUNKITOOLS_DIR', '/munkitools')
 if not os.path.exists(MUNKITOOLS_DIR):
     MUNKITOOLS_DIR = os.path.join(BASE_DIR, 'munkitools')
 
-DEFAUL_CATALOG = os.environ.get("DEFAULT_CATALOG", "testing")
+DEFAULT_CATALOG = os.environ.get("DEFAULT_CATALOG", "testing")
 
 # File Upload Settings
 # Maximum upload size in bytes (default: 2GB for large packages)
