@@ -656,9 +656,9 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
                     return Response({'error': 'Invalid PKG file.'}, status=400)
 
             # DMG: depending on libmagic/version, valid DMGs may appear as
-            # application/x-apple-diskimage, application/zlib, or octet-stream.
+            # application/x-apple-diskimage, application/zlib, application/x-xz, or octet-stream.
             if file_ext == '.dmg':
-                if mime_type not in ('application/x-apple-diskimage', 'application/zlib', 'application/octet-stream'):
+                if mime_type not in ('application/x-apple-diskimage', 'application/zlib', 'application/x-xz', 'application/octet-stream'):
                     LOGGER.warning(f"Invalid DMG type detected: {mime_type} for file {filename}")
                     return Response({'error': f'Invalid DMG file type: {mime_type}.'}, status=400)
 
