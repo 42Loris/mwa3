@@ -3,7 +3,7 @@ version: '3.8'
 services:
   munkiwebadmin:
     container_name: munkiwebadmin
-    image: kami23/mwa3
+    image: stevekueng/mwa3
     restart: unless-stopped
     environment:
       - DB=postgres
