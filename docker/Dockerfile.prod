@@ -37,6 +37,7 @@ RUN apt-get update \
     libfuse3-dev \
     golang \
     p7zip-full \
+    unar \
     libmagic1t64 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -83,7 +84,7 @@ WORKDIR $APP_HOME
 COPY . $APP_HOME
 
 # install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends nginx fuse3 libfuse3-dev p7zip-full libmagic1t64
+RUN apt-get update && apt-get install -y --no-install-recommends nginx fuse3 libfuse3-dev p7zip-full unar libmagic1t64
 COPY --from=builder /usr/src/app/wheels /wheels
 RUN pip install --upgrade pip
 RUN pip install --no-cache /wheels/*

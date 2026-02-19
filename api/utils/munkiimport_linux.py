@@ -325,10 +325,11 @@ def mountdmg(dmgpath, mountpoint=None):
       extra extraction step on that file.
     """
 
+    unar = shutil.which("unar")
     seven_zip = shutil.which("7zz") or shutil.which("7z")
-    if not seven_zip:
+    if not unar and not seven_zip:
         print(
-            "Error: `7zz`/`7z` is not installed. Install 7-Zip (e.g. `apt install p7zip-full`).",
+            "Error: no DMG extractor found. Install `unar` (recommended) or 7-Zip (`7zz`/`7z`).",
             file=sys.stderr,
         )
         return ""
@@ -345,21 +346,54 @@ def mountdmg(dmgpath, mountpoint=None):
         except OSError:
             return False
 
-    def _extract(src, dest):
-        proc = subprocess.run(
-            [seven_zip, "x", src, f"-o{dest}", "-y"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+    def _flatten_single_directory(dest):
+        try:
+            entries = list(os.scandir(dest))
+        except OSError:
+            return
+
+        if len(entries) != 1:
+            return
+
+        only = entries[0]
+        if not only.is_dir():
+            return
+
+        inner = only.path
+        try:
+            for child in os.listdir(inner):
+                shutil.move(os.path.join(inner, child), os.path.join(dest, child))
+            os.rmdir(inner)
+        except OSError:
+            # Best-effort; if flattening fails, keep original structure.
+            return
+
+    def _extract(src, dest, *, tool=None):
+        tool = tool or ("unar" if unar else "7z")
+        if tool == "unar":
+            cmd = [unar, "-o", dest, "-f", src]
+        else:
+            cmd = [seven_zip, "x", src, f"-o{dest}", "-y"]
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-            if stderr:
-                print(f"Warning extracting {src}: {stderr}", file=sys.stderr)
+            stdout = proc.stdout.decode("utf-8", errors="replace").strip()
+            msg = stderr or stdout
+            if msg:
+                print(f"Warning extracting {src}: {msg}", file=sys.stderr)
         return _dir_has_entries(dest)
 
     # First pass: extract the DMG container.
-    if not _extract(dmgpath, mountpoint):
-        return ""
+    # Prefer `unar` when available; it handles more DMG variants than p7zip.
+    if not _extract(dmgpath, mountpoint, tool="unar" if unar else "7z"):
+        # If `unar` was present but failed, try 7-Zip as a fallback.
+        if unar and seven_zip and not _extract(dmgpath, mountpoint, tool="7z"):
+            return ""
+        if not _dir_has_entries(mountpoint):
+            return ""
+
+    _flatten_single_directory(mountpoint)
 
     # Optional second pass: if an embedded image file was produced, extract it.
     candidate_exts = {".hfs", ".img", ".iso", ".dmg", ".udif", ".sparseimage", ".apfs"}
@@ -381,7 +415,10 @@ def mountdmg(dmgpath, mountpoint=None):
     if candidate:
         inner_dir = os.path.join(mountpoint, "_inner")
         os.makedirs(inner_dir, exist_ok=True)
-        if _extract(candidate, inner_dir):
+        # If we have an embedded image and `unar` is available, try that first;
+        # otherwise fall back to 7-Zip.
+        if _extract(candidate, inner_dir, tool="unar" if unar else "7z"):
+            _flatten_single_directory(inner_dir)
             print(f"DMG extracted to {inner_dir}")
             return inner_dir
 

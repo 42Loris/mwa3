@@ -25,3 +25,5 @@ favicon.ico
 virtualenv*
 venv*
 munkirepo*
+
+main_munkiwebadmin.yml
