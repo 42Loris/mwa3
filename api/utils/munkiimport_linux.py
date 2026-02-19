@@ -214,7 +214,6 @@ def copy_item_to_repo(repo, itempath, vers, subdirectory=''):
     name, ext = os.path.splitext(item_name)
     if vers:
         if not name.endswith(vers):
-            # add the version number to the end of the filename
             item_name = '%s-%s%s' % (name, vers, ext)
             destination_path_name = os.path.join(destination_path, item_name)
 
@@ -224,8 +223,6 @@ def copy_item_to_repo(repo, itempath, vers, subdirectory=''):
     except munkirepo.RepoError as err:
         raise RepoCopyError(u'Unable to get list of current pkgs: %s' % err) from err
     while destination_path_name in pkgs_list:
-        #print 'File %s already exists...' % destination_path_name
-        # try appending numbers until we have a unique name
         index += 1
         item_name = '%s__%s%s' % (name, index, ext)
         destination_path_name = os.path.join(destination_path, item_name)
@@ -317,26 +314,78 @@ def diskImageIsMounted(dmgpath):
     return False
 
 
+def _has_supported_installer_item(path):
+    """Check if directory contains .pkg, .mpkg, or .app files"""
+    if not os.path.isdir(path):
+        return False
+    for item in os.listdir(path):
+        item_path = os.path.join(path, item)
+        if hasValidPackageExt(item_path) or item.endswith('.app'):
+            return True
+    return False
+
+
+def _extract_with_7z(src: str, dest: str) -> bool:
+    """Helper to extract files with 7z"""
+    extract_cmd = ["7z", "x", src, f"-o{dest}", "-y"]
+    proc = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode('utf-8', errors='replace')
+        print(f"Error extracting {src}: {stderr}", file=sys.stderr)
+        return False
+    return True
+
+
 def mountdmg(dmgpath, mountpoint=None):
-    """Extracts a DMG file on Linux using 7z instead of mounting."""
+    """Extracts a DMG file on Linux using 7z, with support for nested images."""
     if not mountpoint:
-        mountpoint = os.path.join(tempfile.gettempdir(), "mnt_" + os.path.splitext(os.path.basename(dmgpath))[0])
-    
-    # create mountpoint if it doesn't exist
+        base = os.path.splitext(os.path.basename(dmgpath))[0]
+        mountpoint = os.path.join(tempfile.gettempdir(), f"mnt_{base}")
+
     os.makedirs(mountpoint, exist_ok=True)
 
-    # check if 7z is installed
     if not shutil.which("7z"):
         print("Error: `7z` is not installed. Install it with `apt install p7zip-full`.", file=sys.stderr)
         return ""
 
-    # extract the DMG file
-    extract_cmd = ["7z", "x", dmgpath, f"-o{mountpoint}", "-y"]
-    proc = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    if proc.returncode != 0:
-        print(f"Error extracting {dmgpath}: {proc.stderr.decode('utf-8')}", file=sys.stderr)
+    # Stage 1: extract the DMG itself
+    if not _extract_with_7z(dmgpath, mountpoint):
         return ""
+
+    if _has_supported_installer_item(mountpoint):
+        print(f"DMG extracted to {mountpoint}")
+        return mountpoint
+
+    # Stage 2: look for nested disk images and extract them
+    candidate_exts = {'.hfs', '.img', '.iso', '.dmg'}
+    candidates = []
+    try:
+        for name in os.listdir(mountpoint):
+            path = os.path.join(mountpoint, name)
+            if not os.path.isfile(path):
+                continue
+            _, ext = os.path.splitext(name)
+            if ext.lower() in candidate_exts:
+                candidates.append(path)
+    except OSError:
+        candidates = []
+
+    # If nothing found by extension, try single file in directory
+    if not candidates:
+        try:
+            files = [os.path.join(mountpoint, n) for n in os.listdir(mountpoint)]
+            files = [p for p in files if os.path.isfile(p)]
+            if len(files) == 1:
+                candidates = files
+        except OSError:
+            candidates = []
+
+    for candidate in candidates:
+        inner_dir = os.path.join(mountpoint, "_inner")
+        os.makedirs(inner_dir, exist_ok=True)
+        if _extract_with_7z(candidate, inner_dir) and _has_supported_installer_item(inner_dir):
+            print(f"DMG extracted to {inner_dir}")
+            return inner_dir
 
     print(f"DMG extracted to {mountpoint}")
     return mountpoint
