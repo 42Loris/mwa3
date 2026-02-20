@@ -2,7 +2,7 @@
 
 # install dependencies
 apt-get update
-apt-get install -y p7zip-full dmg2img libfsapfs-utils libmagic1t64 || apt-get install -y p7zip-full dmg2img libfsapfs-utils libmagic1
+apt-get install -y p7zip-full dmg2img libfsapfs-utils sleuthkit libmagic1t64 || apt-get install -y p7zip-full dmg2img libfsapfs-utils sleuthkit libmagic1
 
 # migrate database
 python manage.py makemigrations catalogs pkgsinfo manifests icons santa process munkiwebadmin

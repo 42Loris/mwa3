@@ -360,9 +360,19 @@ def mountdmg(dmgpath, mountpoint=None):
     dmg2img_bin = shutil.which("dmg2img")
     seven_zip = shutil.which("7zz") or shutil.which("7z")
     fsapfsmount_bin = shutil.which("fsapfsmount")
+    tsk_recover_bin = shutil.which("tsk_recover")
+    mmls_bin = shutil.which("mmls")
 
     _dbg(
-        f"system={system} seven_zip={seven_zip!r} dmg2img={dmg2img_bin!r} fsapfsmount={fsapfsmount_bin!r}"
+        "system=%s seven_zip=%r dmg2img=%r fsapfsmount=%r tsk_recover=%r mmls=%r"
+        % (
+            system,
+            seven_zip,
+            dmg2img_bin,
+            fsapfsmount_bin,
+            tsk_recover_bin,
+            mmls_bin,
+        )
     )
 
     if not seven_zip and not dmg2img_bin:
@@ -414,6 +424,58 @@ def mountdmg(dmgpath, mountpoint=None):
         """Try mounting an APFS container via libfsapfs (FUSE)."""
         if not fsapfsmount_bin:
             return False
+
+    def _try_tsk_recover(image_path, dest, offset_sectors=0):
+        """Try extracting files from a (partitioned or unpartitioned) image.
+
+        SleuthKit doesn't require a kernel mount and works well in containers.
+        """
+        if not tsk_recover_bin:
+            return False
+        os.makedirs(dest, exist_ok=True)
+        cmd = [tsk_recover_bin, "-a", "-i", "raw"]
+        if offset_sectors:
+            cmd.extend(["-o", str(int(offset_sectors))])
+        cmd.extend([image_path, dest])
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning tsk_recover {image_path}: {msg}", file=sys.stderr)
+            return False
+        try:
+            return any(True for _ in os.scandir(dest))
+        except OSError:
+            return False
+
+    def _mmls_find_hfs_offset_sectors(image_path):
+        """Best-effort: parse `mmls` output to find an HFS+ partition start."""
+        if not mmls_bin:
+            return 0
+        proc = subprocess.run(
+            [mmls_bin, "-B", "-i", "raw", image_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        text = ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode(
+            "utf-8", errors="replace"
+        )
+        # Look for rows like:
+        #  002: 0000000063 0000004095 0000004033  Apple_HFS
+        for line in text.splitlines():
+            if "HFS" not in line and "hfs" not in line:
+                continue
+            # Split and grab the first integer-looking token after the slot.
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            # parts[0] is like "002:"; parts[1] is start sector in -B mode.
+            start_token = parts[1]
+            try:
+                return int(start_token)
+            except ValueError:
+                continue
+        return 0
         os.makedirs(dest, exist_ok=True)
         proc = subprocess.run(
             [fsapfsmount_bin, apfs_path, dest],
@@ -510,6 +572,13 @@ def mountdmg(dmgpath, mountpoint=None):
                 if _try_fsapfs_mount(payload_path, apfs_mount) and _contains_app_or_pkg(apfs_mount):
                     return apfs_mount
 
+            # If this is an HFS payload and 7z can't traverse it, try SleuthKit.
+            if ext.lower() == ".hfs" and tsk_recover_bin:
+                hfs_out = os.path.join(mountpoint, "_hfs")
+                _dbg(f"attempting tsk_recover for {os.path.basename(payload_path)}")
+                if _try_tsk_recover(payload_path, hfs_out, offset_sectors=0) and _contains_app_or_pkg(hfs_out):
+                    return hfs_out
+
     # 2) Fallback: convert DMG -> IMG and try to extract the IMG.
     # Note: many IMG files are partitioned disk images; p7zip may not be able
     # to open them. This is best-effort.
@@ -531,6 +600,15 @@ def mountdmg(dmgpath, mountpoint=None):
 
         if _extract_7z(img_path, mountpoint) and _contains_app_or_pkg(mountpoint):
             return mountpoint
+
+        # If 7z can't read the partitioned image, try SleuthKit on the HFS+ partition.
+        if tsk_recover_bin and mmls_bin:
+            offset = _mmls_find_hfs_offset_sectors(img_path)
+            if offset:
+                raw_out = os.path.join(mountpoint, "_raw")
+                _dbg(f"attempting tsk_recover on {os.path.basename(img_path)} offset={offset}")
+                if _try_tsk_recover(img_path, raw_out, offset_sectors=offset) and _contains_app_or_pkg(raw_out):
+                    return raw_out
 
     return ""
 
