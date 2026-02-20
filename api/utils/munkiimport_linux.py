@@ -317,7 +317,8 @@ def mountdmg(dmgpath, mountpoint=None):
     """Return a directory path containing the DMG's contents.
 
     macOS: mounts the DMG via `hdiutil`.
-    Linux: converts DMG to IMG with `dmg2img`, then extracts the IMG with 7-Zip.
+    Linux: best-effort userspace extraction; supports APFS via libfsapfs (FUSE)
+    when available.
     """
 
     system = platform.system()
@@ -358,8 +359,11 @@ def mountdmg(dmgpath, mountpoint=None):
     # Linux / other
     dmg2img_bin = shutil.which("dmg2img")
     seven_zip = shutil.which("7zz") or shutil.which("7z")
+    fsapfsmount_bin = shutil.which("fsapfsmount")
 
-    _dbg(f"system={system} seven_zip={seven_zip!r} dmg2img={dmg2img_bin!r}")
+    _dbg(
+        f"system={system} seven_zip={seven_zip!r} dmg2img={dmg2img_bin!r} fsapfsmount={fsapfsmount_bin!r}"
+    )
 
     if not seven_zip and not dmg2img_bin:
         print(
@@ -401,6 +405,27 @@ def mountdmg(dmgpath, mountpoint=None):
             msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
             if msg:
                 print(f"Warning extracting {src}: {msg}", file=sys.stderr)
+        try:
+            return any(True for _ in os.scandir(dest))
+        except OSError:
+            return False
+
+    def _try_fsapfs_mount(apfs_path, dest):
+        """Try mounting an APFS container via libfsapfs (FUSE)."""
+        if not fsapfsmount_bin:
+            return False
+        os.makedirs(dest, exist_ok=True)
+        proc = subprocess.run(
+            [fsapfsmount_bin, apfs_path, dest],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning fsapfsmount {apfs_path}: {msg}", file=sys.stderr)
+            return False
+        # Some failures still return 0 but mount is empty.
         try:
             return any(True for _ in os.scandir(dest))
         except OSError:
@@ -472,8 +497,18 @@ def mountdmg(dmgpath, mountpoint=None):
             _dbg(f"trying payload {os.path.basename(payload_path)} size={_size}")
             inner_dir = os.path.join(mountpoint, "_payload")
             os.makedirs(inner_dir, exist_ok=True)
+
+            # First try 7z extraction of the payload.
             if _extract_7z(payload_path, inner_dir) and _contains_app_or_pkg(inner_dir):
                 return inner_dir
+
+            # If this is an APFS payload and 7z couldn't traverse it, try FUSE.
+            _root, ext = os.path.splitext(payload_path)
+            if ext.lower() == ".apfs" and fsapfsmount_bin:
+                apfs_mount = os.path.join(mountpoint, "_apfs")
+                _dbg(f"attempting fsapfsmount for {os.path.basename(payload_path)}")
+                if _try_fsapfs_mount(payload_path, apfs_mount) and _contains_app_or_pkg(apfs_mount):
+                    return apfs_mount
 
     # 2) Fallback: convert DMG -> IMG and try to extract the IMG.
     # Note: many IMG files are partitioned disk images; p7zip may not be able
@@ -513,6 +548,26 @@ def unmountdmg(dmgpath, mountpoint):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+    else:
+        # If this is a FUSE mount (e.g. fsapfsmount), unmount it first.
+        try:
+            is_mount = os.path.ismount(mountpoint)
+        except OSError:
+            is_mount = False
+        if is_mount:
+            fusermount = shutil.which("fusermount3") or shutil.which("fusermount")
+            if fusermount:
+                subprocess.run(
+                    [fusermount, "-u", mountpoint],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                subprocess.run(
+                    ["umount", mountpoint],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
 
     try:
         shutil.rmtree(mountpoint)
