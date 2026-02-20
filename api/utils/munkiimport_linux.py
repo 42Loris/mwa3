@@ -114,7 +114,12 @@ class MunkiLooseVersion():
             self.parse('')
         if vstring is not None:
             try:
-                if isinstance(vstring, unicode):
+                try:
+                    unicode_type = unicode  # type: ignore[name-defined]
+                except NameError:
+                    unicode_type = str
+
+                if isinstance(vstring, unicode_type):
                     # unicode string! Why? Oh well...
                     # convert to string so version.LooseVersion doesn't choke
                     vstring = vstring.encode('UTF-8')
@@ -248,22 +253,23 @@ def getiteminfo(itempath):
         infodict['type'] = 'application'
         infodict['path'] = itempath
         plist = getBundleInfo(itempath)
-        for key in ['CFBundleName', 'CFBundleIdentifier',
-                    'CFBundleShortVersionString', 'CFBundleVersion']:
-            if key in plist:
-                infodict[key] = plist[key]
-        if 'LSMinimumSystemVersion' in plist:
-            infodict['minosversion'] = plist['LSMinimumSystemVersion']
-        elif 'LSMinimumSystemVersionByArchitecture' in plist:
-            # just grab the highest version if more than one is listed
-            versions = [item[1] for item in
-                        plist['LSMinimumSystemVersionByArchitecture'].items()]
-            highest_version = str(max([MunkiLooseVersion(version)
-                                       for version in versions]))
-            infodict['minosversion'] = highest_version
-        elif 'SystemVersionCheck:MinimumSystemVersion' in plist:
-            infodict['minosversion'] = \
-                plist['SystemVersionCheck:MinimumSystemVersion']
+        if plist:
+            for key in ['CFBundleName', 'CFBundleIdentifier',
+                        'CFBundleShortVersionString', 'CFBundleVersion']:
+                if key in plist:
+                    infodict[key] = plist[key]
+            if 'LSMinimumSystemVersion' in plist:
+                infodict['minosversion'] = plist['LSMinimumSystemVersion']
+            elif 'LSMinimumSystemVersionByArchitecture' in plist:
+                # just grab the highest version if more than one is listed
+                versions = [item[1] for item in
+                            plist['LSMinimumSystemVersionByArchitecture'].items()]
+                highest_version = str(max([MunkiLooseVersion(version)
+                                           for version in versions]))
+                infodict['minosversion'] = highest_version
+            elif 'SystemVersionCheck:MinimumSystemVersion' in plist:
+                infodict['minosversion'] = \
+                    plist['SystemVersionCheck:MinimumSystemVersion']
 
     elif (os.path.exists(os.path.join(itempath, 'Contents', 'Info.plist')) or
           os.path.exists(os.path.join(itempath, 'Resources', 'Info.plist'))):
@@ -406,8 +412,45 @@ def mountdmg(dmgpath, mountpoint=None):
             print(f"Warning converting {src} with dmg2img: {e}", file=sys.stderr)
             return False
 
+    def _contains_supported_installer(root_dir):
+        """Return True if extracted content contains a supported installer item.
+
+        We scan a bit deeper than just the root because many DMGs wrap content
+        in a top-level folder.
+        """
+        try:
+            for dirpath, dirnames, filenames in os.walk(root_dir):
+                # Limit traversal depth to keep this cheap.
+                rel = os.path.relpath(dirpath, root_dir)
+                if rel != '.':
+                    depth = rel.count(os.sep) + 1
+                    if depth > 4:
+                        dirnames[:] = []
+                        continue
+
+                for name in dirnames:
+                    if name.lower().endswith('.app'):
+                        return True
+                for name in filenames:
+                    lower = name.lower()
+                    if lower.endswith('.pkg') or lower.endswith('.mpkg'):
+                        return True
+        except OSError:
+            return False
+        return False
+
     # First pass: try extracting the DMG container directly with 7-Zip.
     extracted = _extract_7z(dmgpath, mountpoint)
+
+    # Some DMGs (notably newer Chrome DMGs) will yield only container artifacts
+    # (partition map + a .hfs blob) when extracted with older p7zip builds.
+    # In that case we still want to try the dmg2img path.
+    if extracted and dmg2img and not _contains_supported_installer(mountpoint):
+        print(
+            f"Info: no .app/.pkg found after 7z extraction of {dmgpath}; trying dmg2img fallback",
+            file=sys.stderr,
+        )
+        extracted = False
 
     # If 7-Zip couldn't extract anything, try dmg2img conversion (if available).
     if not extracted:
@@ -420,6 +463,17 @@ def mountdmg(dmgpath, mountpoint=None):
                 _flatten_single_directory(inner_dir)
                 print(f"DMG extracted to {inner_dir}")
                 return inner_dir
+        else:
+            if dmg2img:
+                print(
+                    f"Warning: dmg2img conversion failed for {dmgpath}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Warning: dmg2img not installed; cannot fall back for {dmgpath}",
+                    file=sys.stderr,
+                )
 
     if not extracted and not _dir_has_entries(mountpoint):
         return ""
@@ -666,6 +720,45 @@ def get_catalog_info_from_dmg(dmgpath, options):
     if not mountpoint:
         raise PkgInfoGenerationError("Could not mount %s!" % dmgpath)
 
+    def _walk_limited(root_dir, max_depth=4):
+        root_dir = os.path.normpath(root_dir)
+        root_depth = root_dir.count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            dirpath = os.path.normpath(dirpath)
+            depth = dirpath.count(os.sep) - root_depth
+            if depth >= max_depth:
+                dirnames[:] = []
+            # Avoid hidden/system folders to reduce noise.
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            yield dirpath, dirnames, filenames
+
+    def _find_first_package(root_dir):
+        candidates = []
+        for dirpath, dirnames, filenames in _walk_limited(root_dir, max_depth=4):
+            for name in dirnames + filenames:
+                lower = name.lower()
+                if lower.endswith('.pkg') or lower.endswith('.mpkg'):
+                    abspath = os.path.join(dirpath, name)
+                    relpath = os.path.relpath(abspath, root_dir)
+                    candidates.append((relpath.count(os.sep), abspath, relpath))
+        if not candidates:
+            return None, None
+        _, abspath, relpath = sorted(candidates, key=lambda t: t[0])[0]
+        return abspath, relpath
+
+    def _find_first_app(root_dir):
+        candidates = []
+        for dirpath, dirnames, _filenames in _walk_limited(root_dir, max_depth=4):
+            for name in dirnames:
+                if name.lower().endswith('.app'):
+                    abspath = os.path.join(dirpath, name)
+                    relpath = os.path.relpath(abspath, root_dir)
+                    candidates.append((relpath.count(os.sep), abspath, relpath))
+        if not candidates:
+            return None, None
+        _, abspath, relpath = sorted(candidates, key=lambda t: t[0])[0]
+        return abspath, relpath
+
     # On Linux, mountdmg() returns a single extraction directory path.
     print("Mounted %s at %s" % (dmgpath, mountpoint))
     if options.pkgname:
@@ -681,6 +774,14 @@ def get_catalog_info_from_dmg(dmgpath, options):
                 cataloginfo = get_catalog_info_from_path(itempath, options)
                 # get out of fsitem loop
                 break
+
+        # Many DMGs wrap the installer in a top-level folder; search deeper.
+        if not cataloginfo:
+            pkg_abspath, pkg_relpath = _find_first_package(mountpoint)
+            if pkg_abspath:
+                cataloginfo = get_catalog_info_from_path(pkg_abspath, options)
+                if cataloginfo:
+                    cataloginfo['package_path'] = pkg_relpath
 
     if not cataloginfo:
         # maybe this is a drag-n-drop dmg
@@ -716,6 +817,13 @@ def get_catalog_info_from_dmg(dmgpath, options):
                     iteminfo = getiteminfo(itempath)
                     if iteminfo:
                         break
+
+            # Some DMGs place the .app inside a folder; search a bit deeper.
+            if not iteminfo:
+                app_abspath, app_relpath = _find_first_app(mountpoint)
+                if app_abspath and app_relpath:
+                    item = app_relpath
+                    iteminfo = getiteminfo(app_abspath)
 
         if iteminfo:
             item_to_copy = {}
@@ -884,29 +992,31 @@ def getChoiceChangesXML(pkgitem):
 
 
 def isApplication(pathname):
-    """Returns true if path appears to be an OS X application"""
-    # No symlinks, please
+    """Return True if path appears to be a macOS app bundle.
+
+    For Linux DMG extraction we primarily rely on the presence of
+    `Contents/Info.plist` (or `Resources/Info.plist`) because some extraction
+    tools omit binaries/symlinks and the executable may not exist.
+    """
+    if not pathname:
+        return False
     if os.path.islink(pathname):
         return False
-    if pathname.endswith('.app'):
-        return True
-    if os.path.isdir(pathname):
-        # look for app bundle structure
-        # use Info.plist to determine the name of the executable
-        plist = getBundleInfo(pathname)
-        if plist:
-            if 'CFBundlePackageType' in plist:
-                if plist['CFBundlePackageType'] != 'APPL':
-                    return False
-            # get CFBundleExecutable,
-            # falling back to bundle name if it's missing
-            bundleexecutable = plist.get(
-                'CFBundleExecutable', os.path.basename(pathname))
-            bundleexecutablepath = os.path.join(
-                pathname, 'Contents', 'MacOS', bundleexecutable)
-            if os.path.exists(bundleexecutablepath):
-                return True
-    return False
+    if not os.path.isdir(pathname):
+        return False
+    if not pathname.endswith('.app'):
+        return False
+
+    plist = getBundleInfo(pathname)
+    if not isinstance(plist, dict) or not plist:
+        return False
+
+    # If present, validate the package type. If missing, still accept.
+    pkg_type = plist.get('CFBundlePackageType')
+    if pkg_type and pkg_type != 'APPL':
+        return False
+
+    return True
 
 
 def listdir(path):
