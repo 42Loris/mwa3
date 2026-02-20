@@ -327,6 +327,12 @@ def mountdmg(dmgpath, mountpoint=None):
     else:
         os.makedirs(mountpoint, exist_ok=True)
 
+    debug_dmg = os.environ.get("MWA_DMG_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
+    def _dbg(msg):
+        if debug_dmg:
+            print(f"DMGDEBUG: {msg}", file=sys.stderr)
+
     if system == "Darwin":
         cmd = [
             "hdiutil",
@@ -352,47 +358,146 @@ def mountdmg(dmgpath, mountpoint=None):
     # Linux / other
     dmg2img_bin = shutil.which("dmg2img")
     seven_zip = shutil.which("7zz") or shutil.which("7z")
-    if not dmg2img_bin:
-        print("Error: `dmg2img` is required to process DMGs on Linux.", file=sys.stderr)
-        return ""
-    if not seven_zip:
-        print("Error: `7zz`/`7z` is required to extract DMG images on Linux.", file=sys.stderr)
-        return ""
 
-    img_path = os.path.join(mountpoint, "_image.img")
-    proc = subprocess.run(
-        [dmg2img_bin, dmgpath, img_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
-        if msg:
-            print(f"Warning converting {dmgpath} to img: {msg}", file=sys.stderr)
+    _dbg(f"system={system} seven_zip={seven_zip!r} dmg2img={dmg2img_bin!r}")
+
+    if not seven_zip and not dmg2img_bin:
+        print(
+            "Error: need `7zz`/`7z` and/or `dmg2img` to process DMGs on Linux.",
+            file=sys.stderr,
+        )
         return ""
 
-    proc = subprocess.run(
-        [seven_zip, "x", img_path, f"-o{mountpoint}", "-y"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
-        if msg:
-            print(f"Warning extracting {img_path}: {msg}", file=sys.stderr)
+    def _contains_app_or_pkg(root_dir, max_depth=4):
+        root_dir = os.path.normpath(root_dir)
+        root_depth = root_dir.count(os.sep)
+        try:
+            for dirpath, dirnames, filenames in os.walk(root_dir):
+                dirpath = os.path.normpath(dirpath)
+                depth = dirpath.count(os.sep) - root_depth
+                if depth >= max_depth:
+                    dirnames[:] = []
+                dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+                for name in dirnames:
+                    if name.lower().endswith('.app'):
+                        return True
+                for name in filenames:
+                    lower = name.lower()
+                    if lower.endswith('.pkg') or lower.endswith('.mpkg'):
+                        return True
+        except OSError:
+            return False
+        return False
 
-    try:
-        entries = [
-            name
-            for name in os.listdir(mountpoint)
-            if not name.startswith('.') and name != os.path.basename(img_path)
-        ]
-    except OSError:
-        entries = []
-    if not entries:
-        return ""
+    def _extract_7z(src, dest):
+        if not seven_zip:
+            return False
+        proc = subprocess.run(
+            [seven_zip, "x", src, f"-o{dest}", "-y"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning extracting {src}: {msg}", file=sys.stderr)
+        try:
+            return any(True for _ in os.scandir(dest))
+        except OSError:
+            return False
 
-    return mountpoint
+    def _debug_list_7z(path_to_list):
+        if not (debug_dmg and seven_zip):
+            return
+        proc = subprocess.run(
+            [seven_zip, "l", "-slt", path_to_list],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out = (proc.stdout or b"") + b"\n" + (proc.stderr or b"")
+        text = out.decode("utf-8", errors="replace")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        head = "\n".join(lines[:120])
+        _dbg(f"7z l -slt {os.path.basename(path_to_list)} rc={proc.returncode}\n{head}")
+
+    def _debug_top_level(dir_path):
+        if not debug_dmg:
+            return
+        try:
+            names = [n for n in os.listdir(dir_path) if not n.startswith('.')]
+        except OSError as e:
+            _dbg(f"listdir failed for {dir_path}: {e}")
+            return
+        names = sorted(names)[:80]
+        rows = []
+        for n in names:
+            p = os.path.join(dir_path, n)
+            try:
+                size = os.path.getsize(p) if os.path.isfile(p) else None
+            except OSError:
+                size = None
+            rows.append(f"- {n}{'' if size is None else f' ({size} bytes)'}")
+        _dbg(f"top-level entries in {dir_path}:\n" + "\n".join(rows))
+
+    # 1) Preferred: extract the DMG container. For many DMGs this yields a
+    #    filesystem payload file like *.hfs or *.apfs, even if p7zip can't
+    #    directly traverse the filesystem.
+    if seven_zip:
+        _debug_list_7z(dmgpath)
+        extracted = _extract_7z(dmgpath, mountpoint)
+        _debug_top_level(mountpoint)
+        if extracted and _contains_app_or_pkg(mountpoint):
+            return mountpoint
+
+        # If we didn't get an .app/.pkg, try extracting an embedded payload.
+        payload_exts = {".hfs", ".apfs", ".img", ".iso"}
+        try:
+            candidates = []
+            for name in os.listdir(mountpoint):
+                p = os.path.join(mountpoint, name)
+                if not os.path.isfile(p):
+                    continue
+                _root, ext = os.path.splitext(name)
+                if ext.lower() in payload_exts:
+                    try:
+                        size = os.path.getsize(p)
+                    except OSError:
+                        size = 0
+                    candidates.append((size, p))
+            candidates.sort(reverse=True)
+        except OSError:
+            candidates = []
+
+        for _size, payload_path in candidates:
+            _dbg(f"trying payload {os.path.basename(payload_path)} size={_size}")
+            inner_dir = os.path.join(mountpoint, "_payload")
+            os.makedirs(inner_dir, exist_ok=True)
+            if _extract_7z(payload_path, inner_dir) and _contains_app_or_pkg(inner_dir):
+                return inner_dir
+
+    # 2) Fallback: convert DMG -> IMG and try to extract the IMG.
+    # Note: many IMG files are partitioned disk images; p7zip may not be able
+    # to open them. This is best-effort.
+    if dmg2img_bin and seven_zip:
+        img_path = os.path.join(mountpoint, "_image.img")
+        proc = subprocess.run(
+            [dmg2img_bin, dmgpath, img_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning converting {dmgpath} to img: {msg}", file=sys.stderr)
+            return ""
+
+        _dbg(f"dmg2img produced {img_path}")
+        _debug_list_7z(img_path)
+
+        if _extract_7z(img_path, mountpoint) and _contains_app_or_pkg(mountpoint):
+            return mountpoint
+
+    return ""
 
 
 def unmountdmg(dmgpath, mountpoint):
