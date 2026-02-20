@@ -806,9 +806,7 @@ class PkgsDetailAPIView(GenericAPIView, ListModelMixin):
 
             # Step 1: Write package file from temp file (memory-efficient)
             try:
-                with open(temp_file_path, 'rb') as source_file:
-                    file_data = source_file.read()  # Read once for writing
-                MunkiRepo.writedata(file_data, "pkgs", pkg_path)
+                MunkiRepo.put_from_local_file("pkgs", pkg_path, temp_file_path)
                 pkg_path_written = pkg_path
                 LOGGER.info(f"Package written successfully: {pkg_path}")
             except (IOError, OSError) as err:

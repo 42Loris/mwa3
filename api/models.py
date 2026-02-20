@@ -112,6 +112,31 @@ class MunkiRepo(object):
         except munkirepo.RepoError as err:
             LOGGER.error('Write failed for %s/%s: %s', kind, pathname, err)
             raise FileWriteError(err)
+
+    @classmethod
+    def put_from_local_file(cls, kind, pathname, local_path):
+        """Writes a repo item from a local file path.
+
+        Uses the repo plugin's `put_from_local_file` when available to avoid
+        loading large files into memory.
+        """
+        try:
+            putter = getattr(repo, 'put_from_local_file', None)
+            if callable(putter):
+                putter(kind + '/' + pathname, local_path)
+                LOGGER.info('Wrote %s/%s from local file', kind, pathname)
+                return
+
+            # Fallback: read and write (kept for plugins without put_from_local_file).
+            with open(local_path, 'rb') as f:
+                repo.put(kind + '/' + pathname, f.read())
+            LOGGER.info('Wrote %s/%s (fallback read)', kind, pathname)
+        except (OSError, IOError) as err:
+            LOGGER.error('Local file read failed for %s: %s', local_path, err)
+            raise FileWriteError(err)
+        except munkirepo.RepoError as err:
+            LOGGER.error('Write failed for %s/%s from %s: %s', kind, pathname, local_path, err)
+            raise FileWriteError(err)
     
     @classmethod
     def delete(cls, kind, pathname):

@@ -278,11 +278,12 @@ def getiteminfo(itempath):
         infodict['type'] = 'plist'
         infodict['path'] = itempath
         try:
-            plist = FoundationPlist.readPlist(itempath)
+            with open(itempath, "rb") as f:
+                plist = plistlib.load(f)
             for key in ['CFBundleShortVersionString', 'CFBundleVersion']:
                 if key in plist:
                     infodict[key] = plist[key]
-        except FoundationPlist.NSPropertyListSerializationException:
+        except Exception:
             pass
 
     # let's help the admin -- if CFBundleShortVersionString is empty
@@ -315,30 +316,34 @@ def diskImageIsMounted(dmgpath):
 
 
 def mountdmg(dmgpath, mountpoint=None):
-    """Extracts a DMG file on Linux using 7z/7zz instead of mounting.
+    """Extracts a DMG file on Linux.
 
-    Keep this intentionally simple:
-    - Prefer `7zz` when available.
+    Notes:
+    - We don't *mount* disk images here (no root, and often not possible in
+      hosted environments). Instead we best-effort extract their contents.
+    - Prefer 7-Zip (`7zz`/`7z`) for extraction.
+    - If 7-Zip can't read the DMG container, try converting it with `dmg2img`
+      (if installed) and extract the resulting image.
     - If extraction returns non-zero but still produced files, treat it as a
       warning (common for DMGs with partial/unsupported sections).
-    - If the DMG only yielded an embedded image file (e.g. *.hfs), try one
-      extra extraction step on that file.
     """
 
-    unar = shutil.which("unar")
     seven_zip = shutil.which("7zz") or shutil.which("7z")
-    if not unar and not seven_zip:
+    dmg2img = shutil.which("dmg2img")
+    if not seven_zip and not dmg2img:
         print(
-            "Error: no DMG extractor found. Install `unar` (recommended) or 7-Zip (`7zz`/`7z`).",
+            "Error: no DMG extractor found. Install 7-Zip (`7zz`/`7z`) and/or `dmg2img`.",
             file=sys.stderr,
         )
         return ""
 
+    # Always use a unique extraction directory to avoid collisions across
+    # concurrent uploads.
     if not mountpoint:
         base = os.path.splitext(os.path.basename(dmgpath))[0]
-        mountpoint = os.path.join(tempfile.gettempdir(), f"mnt_{base}")
-
-    os.makedirs(mountpoint, exist_ok=True)
+        mountpoint = tempfile.mkdtemp(prefix=f"mnt_{base}_")
+    else:
+        os.makedirs(mountpoint, exist_ok=True)
 
     def _dir_has_entries(path):
         try:
@@ -365,37 +370,64 @@ def mountdmg(dmgpath, mountpoint=None):
                 shutil.move(os.path.join(inner, child), os.path.join(dest, child))
             os.rmdir(inner)
         except OSError:
-            # Best-effort; if flattening fails, keep original structure.
             return
 
-    def _extract(src, dest, *, tool=None):
-        tool = tool or ("unar" if unar else "7z")
-        if tool == "unar":
-            cmd = [unar, "-o", dest, "-f", src]
-        else:
-            cmd = [seven_zip, "x", src, f"-o{dest}", "-y"]
+    def _extract_7z(src, dest):
+        if not seven_zip:
+            return False
 
+        cmd = [seven_zip, "x", src, f"-o{dest}", "-y"]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", errors="replace").strip()
             stdout = proc.stdout.decode("utf-8", errors="replace").strip()
             msg = stderr or stdout
             if msg:
                 print(f"Warning extracting {src}: {msg}", file=sys.stderr)
+
         return _dir_has_entries(dest)
 
-    # First pass: extract the DMG container.
-    # Prefer `unar` when available; it handles more DMG variants than p7zip.
-    if not _extract(dmgpath, mountpoint, tool="unar" if unar else "7z"):
-        # If `unar` was present but failed, try 7-Zip as a fallback.
-        if unar and seven_zip and not _extract(dmgpath, mountpoint, tool="7z"):
-            return ""
-        if not _dir_has_entries(mountpoint):
-            return ""
+    def _convert_with_dmg2img(src, dest_img):
+        if not dmg2img:
+            return False
+        try:
+            cmd = [dmg2img, src, dest_img]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+                stdout = proc.stdout.decode("utf-8", errors="replace").strip()
+                msg = stderr or stdout
+                if msg:
+                    print(f"Warning converting {src} with dmg2img: {msg}", file=sys.stderr)
+                return False
+            return os.path.exists(dest_img) and os.path.getsize(dest_img) > 0
+        except Exception as e:
+            print(f"Warning converting {src} with dmg2img: {e}", file=sys.stderr)
+            return False
+
+    # First pass: try extracting the DMG container directly with 7-Zip.
+    extracted = _extract_7z(dmgpath, mountpoint)
+
+    # If 7-Zip couldn't extract anything, try dmg2img conversion (if available).
+    if not extracted:
+        converted_img = os.path.join(mountpoint, "_converted.img")
+        if _convert_with_dmg2img(dmgpath, converted_img):
+            inner_dir = os.path.join(mountpoint, "_inner")
+            os.makedirs(inner_dir, exist_ok=True)
+            extracted = _extract_7z(converted_img, inner_dir)
+            if extracted:
+                _flatten_single_directory(inner_dir)
+                print(f"DMG extracted to {inner_dir}")
+                return inner_dir
+
+    if not extracted and not _dir_has_entries(mountpoint):
+        return ""
 
     _flatten_single_directory(mountpoint)
 
     # Optional second pass: if an embedded image file was produced, extract it.
+    # Avoid blindly trying to extract arbitrary files (e.g. .DS_Store).
     candidate_exts = {".hfs", ".img", ".iso", ".dmg", ".udif", ".sparseimage", ".apfs"}
     try:
         files = [os.path.join(mountpoint, n) for n in os.listdir(mountpoint)]
@@ -409,15 +441,11 @@ def mountdmg(dmgpath, mountpoint=None):
         if ext.lower() in candidate_exts:
             candidate = p
             break
-    if candidate is None and len(files) == 1:
-        candidate = files[0]
 
     if candidate:
         inner_dir = os.path.join(mountpoint, "_inner")
         os.makedirs(inner_dir, exist_ok=True)
-        # If we have an embedded image and `unar` is available, try that first;
-        # otherwise fall back to 7-Zip.
-        if _extract(candidate, inner_dir, tool="unar" if unar else "7z"):
+        if _extract_7z(candidate, inner_dir):
             _flatten_single_directory(inner_dir)
             print(f"DMG extracted to {inner_dir}")
             return inner_dir
@@ -634,21 +662,21 @@ def get_catalog_info_from_dmg(dmgpath, options):
     To-do: handle multiple installer items on a disk image(?)
     """
     cataloginfo = None
-    mountpoints = mountdmg(dmgpath)
-    if not mountpoints:
+    mountpoint = mountdmg(dmgpath)
+    if not mountpoint:
         raise PkgInfoGenerationError("Could not mount %s!" % dmgpath)
 
-    print("Mounted %s at %s" % (dmgpath, mountpoints))
+    # On Linux, mountdmg() returns a single extraction directory path.
+    print("Mounted %s at %s" % (dmgpath, mountpoint))
     if options.pkgname:
-        pkgpath = os.path.join(mountpoints[0], options.pkgname)
+        pkgpath = os.path.join(mountpoint, options.pkgname)
         cataloginfo = get_catalog_info_from_path(pkgpath, options)
         if cataloginfo:
             cataloginfo['package_path'] = options.pkgname
     elif not options.item:
         # search for first package at root
-        print(mountpoints)
-        for fsitem in listdir(mountpoints):
-            itempath = os.path.join(mountpoints, fsitem)
+        for fsitem in listdir(mountpoint):
+            itempath = os.path.join(mountpoint, fsitem)
             if hasValidInstallerItemExt(itempath):
                 cataloginfo = get_catalog_info_from_path(itempath, options)
                 # get out of fsitem loop
@@ -667,22 +695,22 @@ def get_catalog_info_from_dmg(dmgpath, options):
             # following scenarios:
             # ("/mountpoint", "relative/path")  -> "/mountpoint/relative/path"
             # ("/mountpoint", "/absolute/path") -> "/absolute/path"
-            itempath = os.path.join(mountpoints, item)
+            itempath = os.path.join(mountpoint, item)
 
             # Now check that the item actually exists and is located within the
             # mount point
-            if os.path.exists(itempath) and itempath.startswith(mountpoints):
+            if os.path.exists(itempath) and os.path.normpath(itempath).startswith(os.path.normpath(mountpoint)):
                 iteminfo = getiteminfo(itempath)
             else:
-                unmountdmg(dmgpath, mountpoints)
+                unmountdmg(dmgpath, mountpoint)
                 raise PkgInfoGenerationError(
                     "%s not found on disk image." % item)
         else:
             # no item specified; look for an application at root of
             # mounted dmg
             item = ''
-            for itemname in listdir(mountpoints):
-                itempath = os.path.join(mountpoints, itemname)
+            for itemname in listdir(mountpoint):
+                itempath = os.path.join(mountpoint, itemname)
                 if isApplication(itempath):
                     item = itemname
                     iteminfo = getiteminfo(itempath)
@@ -691,17 +719,20 @@ def get_catalog_info_from_dmg(dmgpath, options):
 
         if iteminfo:
             item_to_copy = {}
+            dest_item = None
             if os.path.isabs(item):
                 # Absolute path given
                 # Remove the mountpoint from item path
-                mountpoint_pattern = "^%s/" % mountpoints
-                item = re.sub(mountpoint_pattern, '', item)
+                mountpoint_pattern = "^%s/" % re.escape(os.path.normpath(mountpoint))
+                rel_item = re.sub(mountpoint_pattern, '', os.path.normpath(item))
+                item = rel_item
+                dest_item = rel_item
             else:
                 dest_item = item
 
             # Use only the last path component when
             # composing the path key of an installs item
-            dest_item_filename = os.path.split(dest_item)[1]
+            dest_item_filename = os.path.split(dest_item or item)[1]
 
 
             iteminfo['path'] = os.path.join(
@@ -721,7 +752,7 @@ def get_catalog_info_from_dmg(dmgpath, options):
             cataloginfo['uninstallable'] = True
             cataloginfo['uninstall_method'] = "remove_copied_items"
 
-    unmountdmg(dmgpath, mountpoints)
+    unmountdmg(dmgpath, mountpoint)
     return cataloginfo
 
 
@@ -899,14 +930,22 @@ def listdir(path):
     # http://lists.zerezo.com/git/msg643117.html
     # http://unicode.org/reports/tr15/    section 1.2
     # pylint: disable=unicode-builtin
-    if isinstance(path, str):
+    # Python 2 compatibility helpers in a Python 3 runtime can raise NameError
+    # when referencing `unicode`. Keep this safe and minimal.
+    try:
+        unicode_type = unicode  # type: ignore[name-defined]
+    except NameError:
+        unicode_type = str
+
+    if isinstance(path, bytes):
         try:
-            path = unicode(path, 'utf-8')
-        except NameError:
-            # Python 3
-            pass
-    elif not isinstance(path, unicode):
-        path = unicode(path)
+            path = path.decode('utf-8')
+        except Exception:
+            path = path.decode(errors='replace')
+
+    if not isinstance(path, (str, unicode_type)):
+        path = str(path)
+
     return os.listdir(path)
 
 
