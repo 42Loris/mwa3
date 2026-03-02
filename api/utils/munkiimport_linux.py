@@ -24,6 +24,9 @@ import platform
 from urllib.parse import unquote
 from xml.dom import minidom
 
+# bzip2 magic bytes ("BZh" header) for detecting compressed DMGs
+_BZIP2_MAGIC = b'\x42\x5a\x68'
+
 # import munkitools
 from django.conf import settings
 MUNKITOOLS_DIR = settings.MUNKITOOLS_DIR
@@ -420,9 +423,58 @@ def mountdmg(dmgpath, mountpoint=None):
         except OSError:
             return False
 
+    def _is_bzip2_compressed(filepath):
+        """Check if a file is bzip2-compressed by reading its magic bytes."""
+        try:
+            with open(filepath, 'rb') as f:
+                return f.read(3) == _BZIP2_MAGIC
+        except OSError:
+            return False
+
+    def _decompress_bzip2(filepath):
+        """Decompress a bzip2-wrapped DMG. Returns path to decompressed file."""
+        bzip2_bin = shutil.which("bzip2")
+        if not bzip2_bin:
+            _dbg("bzip2 not found, skipping decompression")
+            return None
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        decompressed = os.path.join(mountpoint, f"{base}_decompressed.dmg")
+        _dbg(f"bzip2-compressed DMG detected, decompressing to {decompressed}")
+        with open(decompressed, 'wb') as out_f:
+            proc = subprocess.run(
+                [bzip2_bin, "-dc", filepath],
+                stdout=out_f,
+                stderr=subprocess.PIPE,
+            )
+        if proc.returncode != 0:
+            msg = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning decompressing {filepath}: {msg}", file=sys.stderr)
+            try:
+                os.unlink(decompressed)
+            except OSError:
+                pass
+            return None
+        return decompressed
+
     def _try_fsapfs_mount(apfs_path, dest):
         """Try mounting an APFS container via libfsapfs (FUSE)."""
         if not fsapfsmount_bin:
+            return False
+        os.makedirs(dest, exist_ok=True)
+        proc = subprocess.run(
+            [fsapfsmount_bin, apfs_path, dest],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning fsapfsmount {apfs_path}: {msg}", file=sys.stderr)
+            return False
+        try:
+            return any(True for _ in os.scandir(dest))
+        except OSError:
             return False
 
     def _try_tsk_recover(image_path, dest, offset_sectors=0):
@@ -476,22 +528,6 @@ def mountdmg(dmgpath, mountpoint=None):
             except ValueError:
                 continue
         return 0
-        os.makedirs(dest, exist_ok=True)
-        proc = subprocess.run(
-            [fsapfsmount_bin, apfs_path, dest],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0:
-            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
-            if msg:
-                print(f"Warning fsapfsmount {apfs_path}: {msg}", file=sys.stderr)
-            return False
-        # Some failures still return 0 but mount is empty.
-        try:
-            return any(True for _ in os.scandir(dest))
-        except OSError:
-            return False
 
     def _debug_list_7z(path_to_list):
         if not (debug_dmg and seven_zip):
@@ -526,17 +562,63 @@ def mountdmg(dmgpath, mountpoint=None):
             rows.append(f"- {n}{'' if size is None else f' ({size} bytes)'}")
         _dbg(f"top-level entries in {dir_path}:\n" + "\n".join(rows))
 
-    # 1) Preferred: extract the DMG container. For many DMGs this yields a
-    #    filesystem payload file like *.hfs or *.apfs, even if p7zip can't
-    #    directly traverse the filesystem.
+    # --- Handle bzip2-compressed DMGs (e.g. Google Chrome) ---
+    working_dmg = dmgpath
+    if _is_bzip2_compressed(dmgpath):
+        decompressed = _decompress_bzip2(dmgpath)
+        if decompressed:
+            working_dmg = decompressed
+        else:
+            _dbg("bzip2 decompression failed, trying original file")
+
+    # === STRATEGY 1 (PRIMARY): dmg2img -> mmls -> tsk_recover ===
+    # Always convert DMG to raw image first, then extract the HFS+ partition.
+    img_path = None
+    if dmg2img_bin:
+        img_path = os.path.join(mountpoint, "_image.img")
+        _dbg(f"converting {os.path.basename(working_dmg)} to raw image")
+        proc = subprocess.run(
+            [dmg2img_bin, working_dmg, img_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+            if msg:
+                print(f"Warning converting {working_dmg} to img: {msg}", file=sys.stderr)
+            img_path = None
+        else:
+            _dbg(f"dmg2img produced {img_path}")
+
+    if img_path:
+        # 1a) SleuthKit: find HFS+ partition offset, then extract files.
+        if tsk_recover_bin:
+            offset = 0
+            if mmls_bin:
+                offset = _mmls_find_hfs_offset_sectors(img_path)
+                _dbg(f"mmls found HFS+ offset={offset} sectors")
+            raw_out = os.path.join(mountpoint, "_raw")
+            _dbg(f"attempting tsk_recover on {os.path.basename(img_path)} offset={offset}")
+            if _try_tsk_recover(img_path, raw_out, offset_sectors=offset) and _contains_app_or_pkg(raw_out):
+                return raw_out
+
+        # 1b) Try 7z on the raw image as secondary approach.
+        if seven_zip:
+            _debug_list_7z(img_path)
+            img_extract_dir = os.path.join(mountpoint, "_img_7z")
+            os.makedirs(img_extract_dir, exist_ok=True)
+            if _extract_7z(img_path, img_extract_dir) and _contains_app_or_pkg(img_extract_dir):
+                return img_extract_dir
+
+    # === STRATEGY 2 (FALLBACK): Direct 7z on DMG ===
     if seven_zip:
-        _debug_list_7z(dmgpath)
-        extracted = _extract_7z(dmgpath, mountpoint)
+        _debug_list_7z(working_dmg)
+        extracted = _extract_7z(working_dmg, mountpoint)
         _debug_top_level(mountpoint)
         if extracted and _contains_app_or_pkg(mountpoint):
             return mountpoint
 
-        # If we didn't get an .app/.pkg, try extracting an embedded payload.
+        # Look for embedded payload files (.hfs, .apfs, .img, .iso)
         payload_exts = {".hfs", ".apfs", ".img", ".iso"}
         try:
             candidates = []
@@ -560,11 +642,9 @@ def mountdmg(dmgpath, mountpoint=None):
             inner_dir = os.path.join(mountpoint, "_payload")
             os.makedirs(inner_dir, exist_ok=True)
 
-            # First try 7z extraction of the payload.
             if _extract_7z(payload_path, inner_dir) and _contains_app_or_pkg(inner_dir):
                 return inner_dir
 
-            # If this is an APFS payload and 7z couldn't traverse it, try FUSE.
             _root, ext = os.path.splitext(payload_path)
             if ext.lower() == ".apfs" and fsapfsmount_bin:
                 apfs_mount = os.path.join(mountpoint, "_apfs")
@@ -572,43 +652,11 @@ def mountdmg(dmgpath, mountpoint=None):
                 if _try_fsapfs_mount(payload_path, apfs_mount) and _contains_app_or_pkg(apfs_mount):
                     return apfs_mount
 
-            # If this is an HFS payload and 7z can't traverse it, try SleuthKit.
             if ext.lower() == ".hfs" and tsk_recover_bin:
                 hfs_out = os.path.join(mountpoint, "_hfs")
                 _dbg(f"attempting tsk_recover for {os.path.basename(payload_path)}")
                 if _try_tsk_recover(payload_path, hfs_out, offset_sectors=0) and _contains_app_or_pkg(hfs_out):
                     return hfs_out
-
-    # 2) Fallback: convert DMG -> IMG and try to extract the IMG.
-    # Note: many IMG files are partitioned disk images; p7zip may not be able
-    # to open them. This is best-effort.
-    if dmg2img_bin and seven_zip:
-        img_path = os.path.join(mountpoint, "_image.img")
-        proc = subprocess.run(
-            [dmg2img_bin, dmgpath, img_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0:
-            msg = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
-            if msg:
-                print(f"Warning converting {dmgpath} to img: {msg}", file=sys.stderr)
-            return ""
-
-        _dbg(f"dmg2img produced {img_path}")
-        _debug_list_7z(img_path)
-
-        if _extract_7z(img_path, mountpoint) and _contains_app_or_pkg(mountpoint):
-            return mountpoint
-
-        # If 7z can't read the partitioned image, try SleuthKit on the HFS+ partition.
-        if tsk_recover_bin and mmls_bin:
-            offset = _mmls_find_hfs_offset_sectors(img_path)
-            if offset:
-                raw_out = os.path.join(mountpoint, "_raw")
-                _dbg(f"attempting tsk_recover on {os.path.basename(img_path)} offset={offset}")
-                if _try_tsk_recover(img_path, raw_out, offset_sectors=offset) and _contains_app_or_pkg(raw_out):
-                    return raw_out
 
     return ""
 
@@ -627,7 +675,31 @@ def unmountdmg(dmgpath, mountpoint):
             stderr=subprocess.PIPE,
         )
     else:
-        # If this is a FUSE mount (e.g. fsapfsmount), unmount it first.
+        # Unmount any FUSE mounts in subdirectories (e.g. _apfs).
+        try:
+            for entry in os.scandir(mountpoint):
+                if entry.is_dir():
+                    try:
+                        if os.path.ismount(entry.path):
+                            fusermount = shutil.which("fusermount3") or shutil.which("fusermount")
+                            if fusermount:
+                                subprocess.run(
+                                    [fusermount, "-u", entry.path],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                )
+                            else:
+                                subprocess.run(
+                                    ["umount", entry.path],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                )
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        # Check the mountpoint itself.
         try:
             is_mount = os.path.ismount(mountpoint)
         except OSError:
