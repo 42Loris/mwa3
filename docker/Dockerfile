@@ -124,3 +124,9 @@ VOLUME [ "/munkirepo" ]
 # run entrypoint.prod.sh
 ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
 EXPOSE 8080
+
+## Custom Changes UZH
+
+# AAM download samba-client
+FROM alpine:latest
+RUN apk add samba-client
