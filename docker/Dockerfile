@@ -44,6 +44,7 @@ RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debia
     libmagic1t64 \
     hfsprogs \
     bzip2 \
+    smbclient \
     && rm -rf /var/lib/apt/lists/*
 
 # set work directory
@@ -89,7 +90,7 @@ WORKDIR $APP_HOME
 COPY . $APP_HOME
 
 # install dependencies
-RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debian.sources || sed -i 's/ main$/ main contrib non-free/' /etc/apt/sources.list \ && apt-get update && apt-get install -y --no-install-recommends nginx fuse3 libfuse3-dev p7zip-full dmg2img libfsapfs-utils sleuthkit libmagic1t64 hfsprogs bzip2 libpq5 && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debian.sources || sed -i 's/ main$/ main contrib non-free/' /etc/apt/sources.list \ && apt-get update && apt-get install -y --no-install-recommends nginx fuse3 libfuse3-dev p7zip-full dmg2img libfsapfs-utils sleuthkit libmagic1t64 hfsprogs bzip2 libpq5 smbclient && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/src/app/wheels /wheels
 RUN pip install --upgrade pip
 RUN pip install --no-cache /wheels/*
@@ -124,9 +125,3 @@ VOLUME [ "/munkirepo" ]
 # run entrypoint.prod.sh
 ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
 EXPOSE 8080
-
-## Custom Changes UZH
-
-# AAM download samba-client
-FROM alpine:latest
-RUN apk add samba-client
