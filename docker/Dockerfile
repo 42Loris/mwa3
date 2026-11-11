@@ -1,127 +1,80 @@
 ###########
 # BUILDER #
 ###########
-
-# pull official base image
 FROM python:3.14-slim AS builder
 
-# set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# install system dependencies
-RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debian.sources || sed -i 's/ main$/ main contrib non-free/' /etc/apt/sources.list \
+RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
-    gcc \
-    default-libmysqlclient-dev \
-    python3-dev \
-    libxml2-dev \
-    libxslt1-dev \
-    zlib1g-dev \
-    libsasl2-dev \
-    libldap2-dev \
-    build-essential \
-    libssl-dev \
-    libffi-dev \
-    libjpeg-dev \
-    libpq-dev \
-    liblcms2-dev \
-    libblas-dev \
-    libopenblas-dev \
-    pkg-config \
-    curl \
-    unzip \
-    git \
-    fuse3 \
-    libfuse3-dev \
-    golang \
-    p7zip-full \
-    dmg2img \
-    libfsapfs-utils \
-    sleuthkit \
-    libmagic1t64 \
-    hfsprogs \
-    bzip2 \
-    cifs-utils \
+       gcc build-essential pkg-config python3-dev \
+       default-libmysqlclient-dev libpq-dev \
+       libxml2-dev libxslt1-dev zlib1g-dev \
+       libsasl2-dev libldap2-dev libssl-dev libffi-dev \
+       libjpeg-dev liblcms2-dev libblas-dev libopenblas-dev \
+       curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# set work directory
-WORKDIR /tmp
-
-# set work directory
 WORKDIR /usr/src/app
 
-# lint
-RUN pip install --upgrade pip
-COPY . /usr/src/app/
+COPY requirements_docker.txt .
+RUN pip install --upgrade pip \
+    && pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements_docker.txt
 
-# install python dependencies
-COPY ./requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements_docker.txt
-
-# download munkitools
-RUN curl -Lk -o /tmp/munkitools.zip `curl --silent https://api.github.com/repos/munki/munki/releases/latest | /usr/bin/awk '/zipball_url/ { print $2 }' | sed 's/[",]//g'` && unzip /tmp/munkitools.zip -d /tmp/munkitools && rm -rf /tmp/munkitools.zip 
-
+# Munki-Tools fix auf 6.7.1: ab Munki 7 fehlt das Python-makecatalogs in code/client
+ARG MUNKI_VERSION=6.7.1
+RUN curl -fsSL -o /tmp/munki.tar.gz \
+       "https://github.com/munki/munki/archive/refs/tags/v${MUNKI_VERSION}.tar.gz" \
+    && mkdir -p /tmp/munkitools \
+    && tar -xzf /tmp/munki.tar.gz -C /tmp/munkitools --strip-components=1 \
+    && test -f /tmp/munkitools/code/client/makecatalogs \
+    && rm /tmp/munki.tar.gz
 
 #########
 # FINAL #
 #########
-
-# pull official base image
 FROM python:3.14-slim
 
-# create the app user
-RUN groupadd -r app && useradd -r -g app app
-
-# create directory for the app user
-RUN mkdir -p /home/app
-RUN mkdir /munkirepo
-RUN mkdir /munkitools
-
-# create the appropriate directories
-ENV HOME=/home/app \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/app \
     APP_HOME=/home/app/web
-RUN mkdir $APP_HOME
-WORKDIR $APP_HOME
 
-# copy project
-COPY . $APP_HOME
+# App-User mit FESTER UID/GID 1000 (muss zu securityContext im Helm-Chart passen)
+RUN groupadd -g 1000 app \
+    && useradd -u 1000 -g app -m -d /home/app -s /usr/sbin/nologin app \
+    && mkdir -p $APP_HOME/staticfiles /munkirepo /munkitools /data
 
-# install dependencies
-RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debian.sources || sed -i 's/ main$/ main contrib non-free/' /etc/apt/sources.list \ && apt-get update && apt-get install -y --no-install-recommends nginx fuse3 libfuse3-dev p7zip-full dmg2img libfsapfs-utils sleuthkit libmagic1t64 hfsprogs bzip2 libpq5 cifs-utils && rm -rf /var/lib/apt/lists/*
+# Laufzeit-Pakete (cifs-utils entfernt: Mount im Container geht ohne privileged nicht)
+RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       nginx libpq5 libmagic1t64 \
+       fuse3 p7zip-full dmg2img libfsapfs-utils sleuthkit hfsprogs bzip2 \
+       smbclient \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /usr/src/app/wheels /wheels
-RUN pip install --upgrade pip
-RUN pip install --no-cache /wheels/*
-COPY --from=builder /tmp/munkitools/munki-munki-*/code/client /munkitools
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
-RUN chmod +x /home/app/web/entrypoint.prod.sh
+COPY --from=builder /tmp/munkitools/code/client /munkitools
 
-# nginx config
+WORKDIR $APP_HOME
+COPY . $APP_HOME
 COPY munkiwebadmin/munkiwebadmin.conf /etc/nginx/sites-available/default
 
-# static files
-RUN mkdir $APP_HOME/staticfiles
-RUN python manage.py collectstatic --noinput
+RUN chmod +x $APP_HOME/entrypoint.prod.sh \
+    && python manage.py collectstatic --noinput \
+    && sed -i 's|/run/nginx.pid|/tmp/nginx.pid|g' /etc/nginx/nginx.conf \
+    && sed -i 's|^user www-data;|# user www-data;|' /etc/nginx/nginx.conf \
+    && chown -R app:app /home/app /munkirepo /munkitools /data \
+                        /var/lib/nginx /var/log/nginx /etc/nginx
 
-# chown all the files to the app user
-RUN chown -R app:app /home/app
-RUN chown -R app:app /munkirepo
-RUN chown -R app:app /munkitools
-RUN chown -R app:app /var/lib/nginx
-RUN chown -R app:app /var/log/nginx
-RUN chown -R app:app /etc/nginx
+USER 1000:1000
 
-# redirect the Nginx PID file to a user-writable directory
-RUN sed -i 's|/run/nginx.pid|/tmp/nginx.pid|g' /etc/nginx/nginx.conf
-
-# change to the app user
-USER app
-
-# volumes
-VOLUME [ "/munkirepo" ]
-
-# run entrypoint.prod.sh
-ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
+VOLUME ["/munkirepo", "/data"]
 EXPOSE 8080
+
+ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
