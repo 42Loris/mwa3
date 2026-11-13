@@ -4,7 +4,36 @@
 #  - gunicorn-Log geht auf stdout → sichtbar in kubectl/Argo CD Logs
 #  - kein Warten mit nc (nc ist im Image nicht installiert)
 set -e
+# ==========================================
+# 1. ROOT CONTEXT: Mount SMB share
+# ==========================================
+if [ "$(id -u)" = "0" ]; then
+  echo "Container started as root. Checking for SMB variables..."
+  
+  if [ -n "$SMB_SERVER" ] && [ -n "$SMB_SHARE" ] && [ -n "$SMB_USER" ] && [ -n "$SMB_PASS" ]; then
+    echo "Mounting SMB share //$SMB_SERVER/$SMB_SHARE to /munkirepo..."
+    
+    # Der Mount ist in einem IF-Block, damit 'set -e' den Container bei einem Mount-Fehler 
+    # nicht ohne Log-Ausgabe sofort killt.
+    if mount -t cifs "//$SMB_SERVER/$SMB_SHARE" /munkirepo -o username="$SMB_USER",password="$SMB_PASS",uid=1000,gid=1000,dir_mode=0755,file_mode=0644; then
+      echo "SMB Mount successful."
+    else
+      echo "CRITICAL: SMB Mount failed! Check K8s securityContext (needs privileged: true)."
+      exit 1
+    fi
+  else
+    echo "Skipping SMB mount: Missing one or more SMB environment variables."
+  fi
 
+  # Privilegien abgeben und das exakt selbe Skript als 'app' User neu ausführen
+  echo "Dropping privileges to user 'app' (uid=1000)..."
+  exec su -s /bin/sh app -c "$0 $@"
+fi
+
+# ==========================================
+# 2. APP USER CONTEXT: Run Application
+# ==========================================
+# Alles ab hier läuft strikt als unprivilegierter User 'app' (UID 1000)
 NAME="MunkiWebAdmin"
 SOCKFILE=/home/app/gunicorn.sock
 NUM_WORKERS="${GUNICORN_WORKERS:-3}"
