@@ -53,7 +53,7 @@ RUN sed -i 's/^Components: .*/& contrib non-free/' /etc/apt/sources.list.d/debia
     && apt-get install -y --no-install-recommends \
        nginx libpq5 libmagic1t64 \
        fuse3 p7zip-full dmg2img libfsapfs-utils sleuthkit hfsprogs bzip2 \
-       smbclient \
+       smbclient cifs-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/wheels /wheels
@@ -72,7 +72,7 @@ RUN chmod +x $APP_HOME/entrypoint.prod.sh \
     && chown -R app:app /home/app /munkirepo /munkitools /data \
                         /var/lib/nginx /var/log/nginx /etc/nginx
 
-USER 1000:1000
+#SER 1000:1000
 
 VOLUME ["/munkirepo", "/data"]
 EXPOSE 8080
